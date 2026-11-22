@@ -4,7 +4,7 @@ import { setFlagsFromString } from 'node:v8';
 
 setFlagsFromString('--no-opt');
 setFlagsFromString('--no-incremental-marking');
-setFlagsFromString('--max-semi-space-size=32');
+setFlagsFromString('--max-semi-space-size=64');
 
 const { run } = (await import(new URL('./solve.js', import.meta.url).href)) as { run: (input: unknown) => unknown };
 

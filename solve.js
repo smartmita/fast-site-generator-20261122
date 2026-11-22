@@ -200,12 +200,13 @@ function fmValueOf(key, raw) {
 function parseFrontMatter(text) {
   const len = text.length;
   const nl0 = text.indexOf('\n');
-  const line0 = nl0 === -1 ? text : text.slice(0, nl0);
-  if (line0 !== '---') return { error: 'no front matter' };
-  if (nl0 === -1) return { error: 'the front matter is not closed' };
+  if (nl0 === -1) return text === '---' ? { error: 'the front matter is not closed' } : { error: 'no front matter' };
+  if (nl0 !== 3 || text.charCodeAt(0) !== 45 || text.charCodeAt(1) !== 45 || text.charCodeAt(2) !== 45) {
+    return { error: 'no front matter' };
+  }
 
   const data = Object.create(null);
-  let pos = nl0 + 1;
+  let pos = 4;
   let lineIdx = 1;
   while (pos <= len) {
     const nl = text.indexOf('\n', pos);
@@ -216,23 +217,24 @@ function parseFrontMatter(text) {
       return { data, body };
     }
     if (!startIsBlank(text, pos, end) && text.charCodeAt(pos) !== 35) {
-      const line = text.slice(pos, end);
-      const colon = line.indexOf(':');
-      if (colon <= 0) return { error: `line ${lineIdx + 1} is not "key: value"` };
+      let colon = -1;
       let validKey = true;
-      for (let k = 0; k < colon; k++) {
-        const kc = line.charCodeAt(k);
-        if (!((kc >= 97 && kc <= 122) || kc === 95)) {
-          validKey = false;
+      for (let k = pos; k < end; k++) {
+        const kc = text.charCodeAt(k);
+        if (kc === 58) {
+          colon = k;
           break;
         }
+        if (!((kc >= 97 && kc <= 122) || kc === 95)) {
+          validKey = false;
+        }
       }
-      if (!validKey) return { error: `line ${lineIdx + 1} is not "key: value"` };
-      if (colon + 1 < line.length && line.charCodeAt(colon + 1) !== 32) return { error: `line ${lineIdx + 1} is not "key: value"` };
-      const key = line.slice(0, colon);
-      let rawEnd = line.length;
-      while (rawEnd > colon + 2 && (line.charCodeAt(rawEnd - 1) === 32 || line.charCodeAt(rawEnd - 1) === 9)) rawEnd--;
-      const raw = colon + 2 <= rawEnd ? line.slice(colon + 2, rawEnd) : '';
+      if (colon <= pos || !validKey) return { error: `line ${lineIdx + 1} is not "key: value"` };
+      if (colon + 1 < end && text.charCodeAt(colon + 1) !== 32) return { error: `line ${lineIdx + 1} is not "key: value"` };
+      const key = text.slice(pos, colon);
+      let rawEnd = end;
+      while (rawEnd > colon + 2 && (text.charCodeAt(rawEnd - 1) === 32 || text.charCodeAt(rawEnd - 1) === 9)) rawEnd--;
+      const raw = colon + 2 <= rawEnd ? text.slice(colon + 2, rawEnd) : '';
       if (!FM_KEYS.has(key)) return { error: `unknown key "${key}"` };
       if (Object.hasOwn(data, key)) return { error: `key "${key}" is given twice` };
       if (raw === '') return { error: `key "${key}" has no value` };
@@ -255,20 +257,20 @@ for (const ch of '\\`*_[]()#+-.!>') ESCAPABLE[ch.charCodeAt(0)] = 1;
 const PARA_STOP = new Uint8Array(128);
 for (const ch of ' \t`#-*') PARA_STOP[ch.charCodeAt(0)] = 1;
 
-function findUnescaped(s, what, from) {
+function findUnescaped(s, what, from, end, hasSlash) {
   const hit = s.indexOf(what, from);
-  if (hit === -1) return -1;
+  const wlen = what.length;
+  const limit = end - wlen;
+  if (hit === -1 || hit > limit) return -1;
+  if (!hasSlash) return hit;
   const sl = s.indexOf('\\', from);
   if (sl === -1 || hit < sl) return hit;
 
-  const len = s.length;
-  const wlen = what.length;
   const c0 = what.charCodeAt(0);
   const c1 = wlen > 1 ? what.charCodeAt(1) : -1;
-  const limit = len - wlen;
   for (let j = from; j <= limit; j++) {
     const c = s.charCodeAt(j);
-    if (c === 92 && j + 1 < len) {
+    if (c === 92 && j + 1 < end) {
       const nc = s.charCodeAt(j + 1);
       if (nc < 128 && ESCAPABLE[nc]) {
         j++;
@@ -280,21 +282,19 @@ function findUnescaped(s, what, from) {
   return -1;
 }
 
-function findSingleStar(s, from) {
+function findSingleStar(s, from, end, hasSlash) {
   let hit = s.indexOf('*', from);
-  if (hit === -1) return -1;
-  const sl = s.indexOf('\\', from);
-  const len = s.length;
-  if (sl === -1) {
-    while (hit !== -1) {
-      if (hit + 1 >= len || s.charCodeAt(hit + 1) !== 42) return hit;
+  if (hit === -1 || hit >= end) return -1;
+  if (!hasSlash || (() => { const sl = s.indexOf('\\', from); return sl === -1 || sl >= end; })()) {
+    while (hit !== -1 && hit < end) {
+      if (hit + 1 >= end || s.charCodeAt(hit + 1) !== 42) return hit;
       hit = s.indexOf('*', hit + 2);
     }
     return -1;
   }
-  for (let j = from; j < len; j++) {
+  for (let j = from; j < end; j++) {
     const c = s.charCodeAt(j);
-    if (c === 92 && j + 1 < len) {
+    if (c === 92 && j + 1 < end) {
       const nc = s.charCodeAt(j + 1);
       if (nc < 128 && ESCAPABLE[nc]) {
         j++;
@@ -302,7 +302,7 @@ function findSingleStar(s, from) {
       }
     }
     if (c !== 42) continue;
-    if (j + 1 < len && s.charCodeAt(j + 1) === 42) {
+    if (j + 1 < end && s.charCodeAt(j + 1) === 42) {
       j++;
       continue;
     }
@@ -311,19 +311,70 @@ function findSingleStar(s, from) {
   return -1;
 }
 
-const MD_RE = /[\\`*[]/g;
+const ALL_RE = /[\\`*[&<>"']/g;
 
-function inline(s, resolveLink) {
-  MD_RE.lastIndex = 0;
-  if (!MD_RE.test(s)) return escapeHtml(s);
-  let idx = MD_RE.lastIndex - 1;
-  const len = s.length;
-  let out = idx > 0 ? escapeHtml(s.slice(0, idx)) : '';
+function inlineRange(s, start, end, resolveLink, linkCtx) {
+  if (start >= end) return '';
+  ALL_RE.lastIndex = start;
+  if (!ALL_RE.test(s) || ALL_RE.lastIndex - 1 >= end) {
+    return start === 0 && end === s.length ? s : s.slice(start, end);
+  }
+  const sl = s.indexOf('\\', start);
+  return inlineRec(s, start, end, resolveLink, linkCtx, sl !== -1 && sl < end, ALL_RE.lastIndex - 1);
+}
+
+function inlineRec(s, start, end, resolveLink, linkCtx, hasSlash, firstIdx) {
+  let idx = firstIdx;
+  if (idx === -1) {
+    ALL_RE.lastIndex = start;
+    if (!ALL_RE.test(s) || ALL_RE.lastIndex - 1 >= end) {
+      return start === 0 && end === s.length ? s : s.slice(start, end);
+    }
+    idx = ALL_RE.lastIndex - 1;
+  }
+  let out = idx > start ? s.slice(start, idx) : '';
   let i = idx;
   while (true) {
     const c = s.charCodeAt(idx);
-    if (c === 92) {
-      if (idx + 1 < len) {
+    if (c <= 62) {
+      if (c === 42) {
+        if (idx + 1 < end && s.charCodeAt(idx + 1) === 42) {
+          const j = findUnescaped(s, '**', idx + 2, end, hasSlash);
+          if (j > idx + 2) {
+            out += `<strong>${inlineRec(s, idx + 2, j, resolveLink, linkCtx, hasSlash, -1)}</strong>`;
+            i = j + 2;
+          } else {
+            out += '**';
+            i = idx + 2;
+          }
+        } else {
+          const j = findSingleStar(s, idx + 1, end, hasSlash);
+          if (j > idx + 1) {
+            out += `<em>${inlineRec(s, idx + 1, j, resolveLink, linkCtx, hasSlash, -1)}</em>`;
+            i = j + 1;
+          } else {
+            out += '*';
+            i = idx + 1;
+          }
+        }
+      } else if (c === 39) {
+        out += '&#39;';
+        i = idx + 1;
+      } else if (c === 34) {
+        out += '&quot;';
+        i = idx + 1;
+      } else if (c === 38) {
+        out += '&amp;';
+        i = idx + 1;
+      } else if (c === 60) {
+        out += '&lt;';
+        i = idx + 1;
+      } else {
+        out += '&gt;';
+        i = idx + 1;
+      }
+    } else if (c === 92) {
+      if (idx + 1 < end) {
         const nc = s.charCodeAt(idx + 1);
         if (nc < 128 && ESCAPABLE[nc]) {
           out += nc === 62 ? '&gt;' : s[idx + 1];
@@ -338,60 +389,38 @@ function inline(s, resolveLink) {
       }
     } else if (c === 96) {
       const j = s.indexOf('`', idx + 1);
-      if (j > idx + 1) {
+      if (j > idx + 1 && j < end) {
         out += `<code>${escapeHtml(s.slice(idx + 1, j))}</code>`;
         i = j + 1;
       } else {
         out += '`';
         i = idx + 1;
       }
-    } else if (c === 42) {
-      if (idx + 1 < len && s.charCodeAt(idx + 1) === 42) {
-        const j = findUnescaped(s, '**', idx + 2);
-        if (j > idx + 2) {
-          out += `<strong>${inline(s.slice(idx + 2, j), resolveLink)}</strong>`;
-          i = j + 2;
-        } else {
-          out += '**';
-          i = idx + 2;
-        }
-      } else {
-        const j = findSingleStar(s, idx + 1);
-        if (j > idx + 1) {
-          out += `<em>${inline(s.slice(idx + 1, j), resolveLink)}</em>`;
-          i = j + 1;
-        } else {
-          out += '*';
-          i = idx + 1;
-        }
-      }
     } else {
-      // c === 91 '['
-      const k = findUnescaped(s, ']', idx + 1);
-      const m = k !== -1 && k + 1 < len && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
-      const target = m === -1 ? '' : s.slice(k + 2, m);
+      const k = findUnescaped(s, ']', idx + 1, end, hasSlash);
+      const m = k !== -1 && k + 1 < end && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
+      const target = m !== -1 && m < end ? s.slice(k + 2, m) : '';
       if (target !== '' && !hasWhitespace(target)) {
-        out += `<a href="${escapeHtml(resolveLink(target))}">${inline(s.slice(idx + 1, k), resolveLink)}</a>`;
+        out += `<a href="${resolveLink(linkCtx, target)}">${inlineRec(s, idx + 1, k, resolveLink, linkCtx, hasSlash, -1)}</a>`;
         i = m + 1;
       } else {
         out += '[';
         i = idx + 1;
       }
     }
-    if (i >= len) break;
-    MD_RE.lastIndex = i;
-    if (!MD_RE.test(s)) {
-      out += escapeHtml(s.slice(i));
+    if (i >= end) break;
+    ALL_RE.lastIndex = i;
+    if (!ALL_RE.test(s) || ALL_RE.lastIndex - 1 >= end) {
+      out += s.slice(i, end);
       break;
     }
-    idx = MD_RE.lastIndex - 1;
-    if (idx > i) out += escapeHtml(s.slice(i, idx));
+    idx = ALL_RE.lastIndex - 1;
+    if (idx > i) out += s.slice(i, idx);
   }
   return out;
 }
 
 const BLANK_RE = /^[ \t]*$/;
-const FENCE_OPEN_RE = /^```([A-Za-z0-9_+-]*)[ \t]*$/;
 
 function isBlankSlice(src, start, end) {
   for (let i = start; i < end; i++) {
@@ -411,9 +440,18 @@ function isFenceCloseSlice(src, pos, end) {
   return pos + 3 <= end && src.charCodeAt(pos) === 96 && src.charCodeAt(pos + 1) === 96 && src.charCodeAt(pos + 2) === 96 && isBlankSlice(src, pos + 3, end);
 }
 
-function isFenceOpenSlice(src, pos, end) {
-  if (pos + 3 > end || src.charCodeAt(pos) !== 96 || src.charCodeAt(pos + 1) !== 96 || src.charCodeAt(pos + 2) !== 96) return false;
-  return FENCE_OPEN_RE.test(src.slice(pos, end));
+function fenceLangEnd(src, pos, end) {
+  if (pos + 3 > end || src.charCodeAt(pos) !== 96 || src.charCodeAt(pos + 1) !== 96 || src.charCodeAt(pos + 2) !== 96) return -1;
+  let i = pos + 3;
+  while (i < end) {
+    const c = src.charCodeAt(i);
+    if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c === 95 || c === 43 || c === 45) {
+      i++;
+    } else {
+      break;
+    }
+  }
+  return isBlankSlice(src, i, end) ? i : -1;
 }
 
 function headingDepthSlice(src, pos, end) {
@@ -426,20 +464,6 @@ function headingDepthSlice(src, pos, end) {
   let t = pos + d + 1;
   while (t < end && (src.charCodeAt(t) === 32 || src.charCodeAt(t) === 9)) t++;
   return t < end ? d : 0;
-}
-
-function headingBounds(src, pos, end) {
-  let d = 0;
-  const max = Math.min(end, pos + 6);
-  while (pos + d < max && src.charCodeAt(pos + d) === 35) d++;
-  if (d === 0 || pos + d >= end) return null;
-  const sp = src.charCodeAt(pos + d);
-  if (sp !== 32 && sp !== 9) return null;
-  let s = pos + d + 1;
-  while (s < end && (src.charCodeAt(s) === 32 || src.charCodeAt(s) === 9)) s++;
-  let e = end;
-  while (e > s && (src.charCodeAt(e - 1) === 32 || src.charCodeAt(e - 1) === 9)) e--;
-  return s < e ? { depth: d, text: src.slice(s, e) } : null;
 }
 
 function isHrSlice(src, pos, end, c0) {
@@ -476,7 +500,7 @@ function endsParagraph(src, start, end) {
   const c0 = src.charCodeAt(start);
   if (c0 >= 128 || !PARA_STOP[c0]) return false;
   if (c0 === 32 || c0 === 9) return isBlankSlice(src, start, end);
-  if (c0 === 96) return isFenceOpenSlice(src, start, end);
+  if (c0 === 96) return fenceLangEnd(src, start, end) !== -1;
   if (c0 === 35) return headingDepthSlice(src, start, end) !== 0;
   return isHrSlice(src, start, end, c0);
 }
@@ -488,7 +512,7 @@ function startIsBlank(src, pos, end) {
   return isBlankSlice(src, pos + 1, end);
 }
 
-function renderMarkdown(src, resolveLink, slugify) {
+function renderMarkdown(src, resolveLink, linkCtx, slugify) {
   const srcLen = src.length;
   const ids = new Set();
   const toc = [];
@@ -508,11 +532,10 @@ function renderMarkdown(src, resolveLink, slugify) {
     const c0 = src.charCodeAt(pos);
     const nextPos = nl === -1 ? srcLen + 1 : nl + 1;
 
-    if (c0 === 96 && pos + 3 <= end && src.charCodeAt(pos + 1) === 96 && src.charCodeAt(pos + 2) === 96) {
-      const fence = FENCE_OPEN_RE.exec(src.slice(pos, end));
-      if (fence !== null) {
-        const lang = fence[1];
-        const openTag = lang === '' ? '<pre><code>' : `<pre><code class="language-${escapeHtml(lang)}">`;
+    if (c0 === 96) {
+      const langEnd = fenceLangEnd(src, pos, end);
+      if (langEnd !== -1) {
+        const openTag = langEnd === pos + 3 ? '<pre><code>' : `<pre><code class="language-${escapeHtml(src.slice(pos + 3, langEnd))}">`;
         pos = nextPos;
         const codeStart = pos;
         let closed = false;
@@ -537,14 +560,25 @@ function renderMarkdown(src, resolveLink, slugify) {
     }
 
     if (c0 === 35) {
-      const heading = headingBounds(src, pos, end);
-      if (heading !== null) {
-        const id = uniqueSlug(slugify(heading.text), ids);
-        const html = inline(heading.text, resolveLink);
-        out += `<h${heading.depth} id="${id}">${html}</h${heading.depth}>\n`;
-        if (heading.depth === 2 || heading.depth === 3) toc.push({ __proto__: null, level: heading.depth, id, html });
-        pos = nextPos;
-        continue;
+      let d = 0;
+      const max = Math.min(end, pos + 6);
+      while (pos + d < max && src.charCodeAt(pos + d) === 35) d++;
+      if (d > 0 && pos + d < end) {
+        const sp = src.charCodeAt(pos + d);
+        if (sp === 32 || sp === 9) {
+          let hs = pos + d + 1;
+          while (hs < end && (src.charCodeAt(hs) === 32 || src.charCodeAt(hs) === 9)) hs++;
+          let he = end;
+          while (he > hs && (src.charCodeAt(he - 1) === 32 || src.charCodeAt(he - 1) === 9)) he--;
+          if (hs < he) {
+            const id = uniqueSlug(slugify(src.slice(hs, he)), ids);
+            const html = inlineRange(src, hs, he, resolveLink, linkCtx);
+            out += `<h${d} id="${id}">${html}</h${d}>\n`;
+            if (d === 2 || d === 3) toc.push({ __proto__: null, level: d, id, html });
+            pos = nextPos;
+            continue;
+          }
+        }
       }
     }
 
@@ -556,23 +590,33 @@ function renderMarkdown(src, resolveLink, slugify) {
       }
       if (pos + 1 < end && src.charCodeAt(pos + 1) === 32) {
         let listHtml = '<ul>\n';
-        let curItem = trimSlice(src, pos + 2, end);
+        let curStart = pos + 2;
+        while (curStart < end && (src.charCodeAt(curStart) === 32 || src.charCodeAt(curStart) === 9)) curStart++;
+        let curEnd = end;
+        while (curEnd > curStart && (src.charCodeAt(curEnd - 1) === 32 || src.charCodeAt(curEnd - 1) === 9)) curEnd--;
+        let curItem = null;
         pos = nextPos;
         while (pos <= srcLen) {
           const nl2 = src.indexOf('\n', pos);
           const end2 = nl2 === -1 ? srcLen : nl2;
           if (isBulletSlice(src, pos, end2)) {
-            listHtml += `<li>${inline(curItem, resolveLink)}</li>\n`;
-            curItem = trimSlice(src, pos + 2, end2);
+            listHtml += `<li>${curItem === null ? inlineRange(src, curStart, curEnd, resolveLink, linkCtx) : inlineRange(curItem, 0, curItem.length, resolveLink, linkCtx)}</li>\n`;
+            curStart = pos + 2;
+            while (curStart < end2 && (src.charCodeAt(curStart) === 32 || src.charCodeAt(curStart) === 9)) curStart++;
+            curEnd = end2;
+            while (curEnd > curStart && (src.charCodeAt(curEnd - 1) === 32 || src.charCodeAt(curEnd - 1) === 9)) curEnd--;
+            curItem = null;
             pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
           } else if (isContinuedSlice(src, pos, end2)) {
+            if (curItem === null) curItem = src.slice(curStart, curEnd);
             curItem += `\n${trimSlice(src, pos, end2)}`;
             pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
           } else {
             break;
           }
         }
-        out += `${listHtml}<li>${inline(curItem, resolveLink)}</li>\n</ul>\n`;
+        const lastHtml = curItem === null ? inlineRange(src, curStart, curEnd, resolveLink, linkCtx) : inlineRange(curItem, 0, curItem.length, resolveLink, linkCtx);
+        out += `${listHtml}<li>${lastHtml}</li>\n</ul>\n`;
         continue;
       }
     }
@@ -604,7 +648,7 @@ function renderMarkdown(src, resolveLink, slugify) {
         }
         pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
       }
-      out += first ? '<blockquote>\n</blockquote>\n' : `<blockquote>\n<p>${inline(qText, resolveLink)}</p>\n</blockquote>\n`;
+      out += first ? '<blockquote>\n</blockquote>\n' : `<blockquote>\n<p>${inlineRange(qText, 0, qText.length, resolveLink, linkCtx)}</p>\n</blockquote>\n`;
       continue;
     }
 
@@ -613,24 +657,34 @@ function renderMarkdown(src, resolveLink, slugify) {
       if (contentPos !== -1) {
         const start = contentPos - 2 === pos + 1 ? src.charCodeAt(pos) - 48 : Number(src.slice(pos, contentPos - 2));
         let listHtml = start !== 1 ? `<ol start="${start}">\n` : '<ol>\n';
-        let curItem = trimSlice(src, contentPos, end);
+        let curStart = contentPos;
+        while (curStart < end && (src.charCodeAt(curStart) === 32 || src.charCodeAt(curStart) === 9)) curStart++;
+        let curEnd = end;
+        while (curEnd > curStart && (src.charCodeAt(curEnd - 1) === 32 || src.charCodeAt(curEnd - 1) === 9)) curEnd--;
+        let curItem = null;
         pos = nextPos;
         while (pos <= srcLen) {
           const nl2 = src.indexOf('\n', pos);
           const end2 = nl2 === -1 ? srcLen : nl2;
           const cPos2 = orderedStartSlice(src, pos, end2);
           if (cPos2 !== -1) {
-            listHtml += `<li>${inline(curItem, resolveLink)}</li>\n`;
-            curItem = trimSlice(src, cPos2, end2);
+            listHtml += `<li>${curItem === null ? inlineRange(src, curStart, curEnd, resolveLink, linkCtx) : inlineRange(curItem, 0, curItem.length, resolveLink, linkCtx)}</li>\n`;
+            curStart = cPos2;
+            while (curStart < end2 && (src.charCodeAt(curStart) === 32 || src.charCodeAt(curStart) === 9)) curStart++;
+            curEnd = end2;
+            while (curEnd > curStart && (src.charCodeAt(curEnd - 1) === 32 || src.charCodeAt(curEnd - 1) === 9)) curEnd--;
+            curItem = null;
             pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
           } else if (isContinuedSlice(src, pos, end2)) {
+            if (curItem === null) curItem = src.slice(curStart, curEnd);
             curItem += `\n${trimSlice(src, pos, end2)}`;
             pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
           } else {
             break;
           }
         }
-        out += `${listHtml}<li>${inline(curItem, resolveLink)}</li>\n</ol>\n`;
+        const lastHtml = curItem === null ? inlineRange(src, curStart, curEnd, resolveLink, linkCtx) : inlineRange(curItem, 0, curItem.length, resolveLink, linkCtx);
+        out += `${listHtml}<li>${lastHtml}</li>\n</ol>\n`;
         continue;
       }
     }
@@ -656,8 +710,9 @@ function renderMarkdown(src, resolveLink, slugify) {
       }
       pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
     }
-    const pText = pLines === null ? src.slice(pStart, pLastEnd) : pLines.join('\n');
-    const html = inline(pText, resolveLink);
+    const html = pLines === null
+      ? inlineRange(src, pStart, pLastEnd, resolveLink, linkCtx)
+      : (() => { const t = pLines.join('\n'); return inlineRange(t, 0, t.length, resolveLink, linkCtx); })();
     if (excerpt === null) excerpt = html;
     out += `<p>${html}</p>\n`;
   }
@@ -778,7 +833,7 @@ function textOf(v) {
 }
 
 function escTextOf(v) {
-  if (typeof v === 'string') return ESC_TEST.test(v) ? v.replace(ESC_RE, escRepl) : v;
+  if (typeof v === 'string') return escapeHtml(v);
   if (typeof v === 'number') return String(v);
   if (typeof v === 'boolean') return v ? 'true' : 'false';
   if (Array.isArray(v)) return escapeHtml(textOf(v));
@@ -998,26 +1053,59 @@ function hasControlFlow(list) {
   return false;
 }
 
-function compileBodyToFn(flat, extraVars, itemCaches, dynRoots) {
+function bodyUsesBareLoop(list) {
+  for (let i = 0; i < list.length; i++) {
+    const n = list[i];
+    if (n.kind === 'var' || n.kind === 'raw') {
+      if (n.path[0] === 'loop' && (n.path.length !== 2 || (n.path[1] !== 'index' && n.path[1] !== 'first' && n.path[1] !== 'last' && n.path[1] !== 'length'))) return true;
+    } else if (n.kind === 'if') {
+      if (n.path[0] === 'loop' && (n.path.length !== 2 || (n.path[1] !== 'index' && n.path[1] !== 'first' && n.path[1] !== 'last' && n.path[1] !== 'length'))) return true;
+      if (bodyUsesBareLoop(n.then)) return true;
+      if (n.else !== null && bodyUsesBareLoop(n.else)) return true;
+    } else if (n.kind === 'for') {
+      if (n.path[0] === 'loop' && (n.path.length !== 2 || (n.path[1] !== 'index' && n.path[1] !== 'first' && n.path[1] !== 'last' && n.path[1] !== 'length'))) return true;
+    }
+  }
+  return false;
+}
+
+function compileTemplateBody(flat, extraVars, itemCaches, dynRoots, isItem) {
   if (flat.length === 0) return () => '';
   if (flat.length === 1 && flat[0].kind === 'text') {
     const s = flat[0].text;
     return () => s;
   }
   let vid = 0;
-  const useArray = hasControlFlow(flat);
-  const lines = useArray ? ['const _p = [];'] : [];
-  const flatParts = useArray ? null : [];
-  const scopeStack = [];
+  const useAcc = hasControlFlow(flat);
+  const lines = useAcc ? ['const _p = [];'] : [];
+  const flatParts = useAcc ? null : [];
+  const scopeStack = isItem ? [{ itemName: isItem, itemVar: '_item', idxVar: null, lenVar: null, loopVar: 'undefined' }] : [];
   const cacheRefs = [];
+  const escCache = new Map();
+  const escDecl = [];
 
   function resolveExpr(path) {
     const rootName = path[0];
+    if (rootName === 'loop' && path.length === 2) {
+      for (let i = scopeStack.length - 1; i >= 0; i--) {
+        const frame = scopeStack[i];
+        if (frame.idxVar !== null) {
+          const p = path[1];
+          if (p === 'index') return `(${frame.idxVar}+1)`;
+          if (p === 'first') return `(${frame.idxVar}===0)`;
+          if (p === 'last') return `(${frame.idxVar}===${frame.lenVar}-1)`;
+          if (p === 'length') return frame.lenVar;
+        }
+        break;
+      }
+    }
     let base = null;
+    let isKnownObj = false;
     for (let i = scopeStack.length - 1; i >= 0; i--) {
       const frame = scopeStack[i];
       if (rootName === 'loop') {
         base = frame.loopVar;
+        isKnownObj = true;
         break;
       }
       if (frame.itemName === rootName) {
@@ -1025,39 +1113,77 @@ function compileBodyToFn(flat, extraVars, itemCaches, dynRoots) {
         break;
       }
     }
-    if (base === null) base = `vars.${rootName}`;
+    if (base === null) {
+      if (isItem) {
+        base = `_stat.${rootName}`;
+      } else {
+        base = `vars.${rootName}`;
+        if (rootName === 'site' || (dynRoots !== null && dynRoots.has(rootName) && rootName !== 'posts')) isKnownObj = true;
+      }
+    }
     let expr = base;
     for (let k = 1; k < path.length; k++) {
       const prop = path[k];
-      const tmp = `_t${vid++}`;
-      expr = `((${tmp}=${expr})!==null&&typeof ${tmp}==='object'&&(!Array.isArray(${tmp})||_has(${tmp},${JSON.stringify(prop)}))?${tmp}.${prop}:undefined)`;
+      if (k === 1 && isKnownObj) {
+        expr = `${expr}.${prop}`;
+      } else {
+        const tmp = `_t${vid++}`;
+        expr = `((${tmp}=${expr})!==null&&typeof ${tmp}==='object'&&(!Array.isArray(${tmp})||_has(${tmp},${JSON.stringify(prop)}))?${tmp}.${prop}:undefined)`;
+      }
     }
     return expr;
   }
 
   function emit(list) {
-    let pushBatch = [];
-    const flushPush = () => {
-      if (pushBatch.length > 0) {
-        lines.push(`_p.push(${pushBatch.join(',')});`);
-        pushBatch = [];
+    let batch = [];
+    const flush = () => {
+      if (batch.length > 0) {
+        lines.push(`_p.push(${batch.join(',')});`);
+        batch = [];
       }
     };
     for (let i = 0; i < list.length; i++) {
       const n = list[i];
       if (n.kind === 'text') {
-        if (useArray) pushBatch.push(JSON.stringify(n.text));
-        else flatParts.push(JSON.stringify(n.text));
+        const lit = JSON.stringify(n.text);
+        if (useAcc) batch.push(lit);
+        else flatParts.push(lit);
       } else if (n.kind === 'var') {
-        const e = `_esc(${resolveExpr(n.path)})`;
-        if (useArray) pushBatch.push(e);
+        const p = n.path;
+        let isSafe = false;
+        if (p.length === 2) {
+          const r = p[0], f = p[1];
+          if (r === 'loop' && (f === 'index' || f === 'length')) isSafe = true;
+          else if (!isItem && dynRoots !== null && dynRoots.has(r)) {
+            if (r === 'page' && (f === 'reading_minutes' || f === 'date' || f === 'date_long' || f === 'slug')) isSafe = true;
+            else if (r === 'pager' && (f === 'number' || f === 'total')) isSafe = true;
+            else if (r === 'tag' && (f === 'count' || f === 'slug')) isSafe = true;
+          }
+        }
+        let e;
+        if (isSafe) {
+          e = resolveExpr(p);
+        } else if (!isItem && scopeStack.length === 0 && p.length === 2 && p[0] === 'page' && p[1] === 'title') {
+          let v = escCache.get('page.title');
+          if (v === undefined) {
+            v = `_e${vid++}`;
+            escCache.set('page.title', v);
+            escDecl.push(`const ${v} = _esc(vars.page.title);`);
+          }
+          e = v;
+        } else {
+          e = `_esc(${resolveExpr(p)})`;
+        }
+        if (useAcc) batch.push(e);
         else flatParts.push(e);
       } else if (n.kind === 'raw') {
-        const e = `_txt(${resolveExpr(n.path)})`;
-        if (useArray) pushBatch.push(e);
+        const p = n.path;
+        const isRawStr = !isItem && dynRoots !== null && dynRoots.has('page') && p.length === 2 && p[0] === 'page' && (p[1] === 'content' || p[1] === 'excerpt');
+        const e = isRawStr ? resolveExpr(p) : `_txt(${resolveExpr(p)})`;
+        if (useAcc) batch.push(e);
         else flatParts.push(e);
       } else if (n.kind === 'if') {
-        flushPush();
+        flush();
         const cond = `_tru(${resolveExpr(n.path)})`;
         lines.push(`if (${n.not ? '!' + cond : cond}) {`);
         emit(n.then);
@@ -1067,12 +1193,12 @@ function compileBodyToFn(flat, extraVars, itemCaches, dynRoots) {
         }
         lines.push('}');
       } else if (n.kind === 'for') {
-        flushPush();
+        flush();
         const arrVar = `_a${vid++}`;
         const lenVar = `_n${vid++}`;
         const idxVar = `_k${vid++}`;
         const itemVar = `_x${vid++}`;
-        const onlyItem = scopeStack.length === 0 && !bodyUsesLoop(n.body) && (() => {
+        const onlyItem = !isItem && scopeStack.length === 0 && !bodyUsesLoop(n.body) && (() => {
           const b = new Set([n.name]);
           return isStaticNodeList(n.body, b, dynRoots);
         })();
@@ -1080,7 +1206,7 @@ function compileBodyToFn(flat, extraVars, itemCaches, dynRoots) {
           const key = n.name + ':' + JSON.stringify(n.body);
           let entry = itemCaches.get(key);
           if (entry === undefined) {
-            const subFn = compileItemRenderer(n.body, n.name, extraVars);
+            const subFn = compileTemplateBody(n.body, extraVars, null, null, n.name);
             entry = { cache: new Map(), fn: subFn };
             itemCaches.set(key, entry);
           }
@@ -1098,17 +1224,17 @@ function compileBodyToFn(flat, extraVars, itemCaches, dynRoots) {
           lines.push('}');
           lines.push('}');
         } else {
-          const needLoop = bodyUsesLoop(n.body);
-          const loopVar = needLoop ? `_l${vid++}` : 'undefined';
+          const needBareLoop = bodyUsesBareLoop(n.body);
+          const loopVar = needBareLoop ? `_l${vid++}` : 'undefined';
           lines.push(`const ${arrVar} = ${resolveExpr(n.path)};`);
           lines.push(`if (Array.isArray(${arrVar})) {`);
           lines.push(`const ${lenVar} = ${arrVar}.length;`);
           lines.push(`for (let ${idxVar} = 0; ${idxVar} < ${lenVar}; ${idxVar}++) {`);
           lines.push(`const ${itemVar} = ${arrVar}[${idxVar}];`);
-          if (needLoop) {
-            lines.push(`const ${loopVar} = { index: ${idxVar} + 1, first: ${idxVar} === 0, last: ${idxVar} === ${lenVar} - 1, length: ${lenVar} };`);
+          if (needBareLoop) {
+            lines.push(`const ${loopVar} = { __proto__: null, index: ${idxVar} + 1, first: ${idxVar} === 0, last: ${idxVar} === ${lenVar} - 1, length: ${lenVar} };`);
           }
-          scopeStack.push({ itemName: n.name, itemVar, loopVar });
+          scopeStack.push({ itemName: n.name, itemVar, idxVar, lenVar, loopVar });
           emit(n.body);
           scopeStack.pop();
           lines.push('}');
@@ -1116,11 +1242,12 @@ function compileBodyToFn(flat, extraVars, itemCaches, dynRoots) {
         }
       }
     }
-    if (useArray) flushPush();
+    if (useAcc) flush();
   }
 
   emit(flat);
-  if (useArray) {
+  if (escDecl.length > 0) lines.unshift(...escDecl);
+  if (useAcc) {
     lines.push('return _p.length === 1 ? _p[0] : _p.join("");');
   } else if (flatParts.length === 0) {
     lines.push('return "";');
@@ -1129,104 +1256,16 @@ function compileBodyToFn(flat, extraVars, itemCaches, dynRoots) {
   } else {
     lines.push(`return [${flatParts.join(',')}].join("");`);
   }
-  const fn = new Function('vars', '_esc', '_txt', '_tru', '_has', '_caches', lines.join('\n'));
-  return (vars) => fn(vars, escTextOf, textOf, truthy, Object.hasOwn, cacheRefs);
+  if (isItem) {
+    const factory = new Function('_stat', '_esc', '_txt', '_tru', '_has', `return function(_item) {\n${lines.join('\n')}\n};`);
+    return factory(extraVars, escTextOf, textOf, truthy, Object.hasOwn);
+  }
+  const factory = new Function('_esc', '_txt', '_tru', '_has', '_caches', `return function(vars) {\n${lines.join('\n')}\n};`);
+  return factory(escTextOf, textOf, truthy, Object.hasOwn, cacheRefs);
 }
 
-function compileItemRenderer(body, itemName, extraVars) {
-  let vid = 0;
-  const useArray = hasControlFlow(body);
-  const lines = useArray ? ['const _p = [];'] : [];
-  const flatParts = useArray ? null : [];
-  const scopeStack = [{ itemName, itemVar: '_item', loopVar: 'undefined' }];
-
-  function resolveExpr(path) {
-    const rootName = path[0];
-    let base = null;
-    for (let i = scopeStack.length - 1; i >= 0; i--) {
-      const frame = scopeStack[i];
-      if (rootName === 'loop') { base = frame.loopVar; break; }
-      if (frame.itemName === rootName) { base = frame.itemVar; break; }
-    }
-    if (base === null) base = `_stat.${rootName}`;
-    let expr = base;
-    for (let k = 1; k < path.length; k++) {
-      const prop = path[k];
-      const tmp = `_t${vid++}`;
-      expr = `((${tmp}=${expr})!==null&&typeof ${tmp}==='object'&&(!Array.isArray(${tmp})||_has(${tmp},${JSON.stringify(prop)}))?${tmp}.${prop}:undefined)`;
-    }
-    return expr;
-  }
-
-  function emit(list) {
-    let pushBatch = [];
-    const flushPush = () => {
-      if (pushBatch.length > 0) {
-        lines.push(`_p.push(${pushBatch.join(',')});`);
-        pushBatch = [];
-      }
-    };
-    for (let i = 0; i < list.length; i++) {
-      const n = list[i];
-      if (n.kind === 'text') {
-        if (useArray) pushBatch.push(JSON.stringify(n.text));
-        else flatParts.push(JSON.stringify(n.text));
-      } else if (n.kind === 'var') {
-        const e = `_esc(${resolveExpr(n.path)})`;
-        if (useArray) pushBatch.push(e);
-        else flatParts.push(e);
-      } else if (n.kind === 'raw') {
-        const e = `_txt(${resolveExpr(n.path)})`;
-        if (useArray) pushBatch.push(e);
-        else flatParts.push(e);
-      } else if (n.kind === 'if') {
-        flushPush();
-        const cond = `_tru(${resolveExpr(n.path)})`;
-        lines.push(`if (${n.not ? '!' + cond : cond}) {`);
-        emit(n.then);
-        if (n.else !== null && n.else.length > 0) {
-          lines.push('} else {');
-          emit(n.else);
-        }
-        lines.push('}');
-      } else if (n.kind === 'for') {
-        flushPush();
-        const arrVar = `_a${vid++}`;
-        const lenVar = `_n${vid++}`;
-        const idxVar = `_k${vid++}`;
-        const itemVar = `_x${vid++}`;
-        const needLoop = bodyUsesLoop(n.body);
-        const loopVar = needLoop ? `_l${vid++}` : 'undefined';
-        lines.push(`const ${arrVar} = ${resolveExpr(n.path)};`);
-        lines.push(`if (Array.isArray(${arrVar})) {`);
-        lines.push(`const ${lenVar} = ${arrVar}.length;`);
-        lines.push(`for (let ${idxVar} = 0; ${idxVar} < ${lenVar}; ${idxVar}++) {`);
-        lines.push(`const ${itemVar} = ${arrVar}[${idxVar}];`);
-        if (needLoop) {
-          lines.push(`const ${loopVar} = { index: ${idxVar} + 1, first: ${idxVar} === 0, last: ${idxVar} === ${lenVar} - 1, length: ${lenVar} };`);
-        }
-        scopeStack.push({ itemName: n.name, itemVar, loopVar });
-        emit(n.body);
-        scopeStack.pop();
-        lines.push('}');
-        lines.push('}');
-      }
-    }
-    if (useArray) flushPush();
-  }
-
-  emit(body);
-  if (useArray) {
-    lines.push('return _p.length === 1 ? _p[0] : _p.join("");');
-  } else if (flatParts.length === 0) {
-    lines.push('return "";');
-  } else if (flatParts.length === 1) {
-    lines.push(`return ${flatParts[0]};`);
-  } else {
-    lines.push(`return [${flatParts.join(',')}].join("");`);
-  }
-  const fn = new Function('_item', '_stat', '_esc', '_txt', '_tru', '_has', lines.join('\n'));
-  return (item) => fn(item, extraVars, escTextOf, textOf, truthy, Object.hasOwn);
+function compileBodyToFn(flat, extraVars, itemCaches, dynRoots) {
+  return compileTemplateBody(flat, extraVars, itemCaches, dynRoots, null);
 }
 
 // ---------------------------------------------------------------- Path helpers
@@ -1259,6 +1298,48 @@ function dirOf(path) {
 }
 
 const SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]*:/;
+
+function resolveLinkCtx(ctx, target) {
+  const cached = ctx.urlMap.get(target);
+  if (cached !== undefined) return cached;
+  const c0 = target.charCodeAt(0);
+  if (c0 === 47 || c0 === 35 || (target.includes(':') && SCHEME_RE.test(target))) {
+    const esc = escapeHtml(target);
+    ctx.urlMap.set(target, esc);
+    return esc;
+  }
+  const hash = target.indexOf('#');
+  const rel = hash === -1 ? target : target.slice(0, hash);
+  const frag = hash === -1 ? '' : target.slice(hash);
+  let path = null;
+  if (rel !== '') {
+    let dirMap = ctx.relCache.get(ctx.dir);
+    if (dirMap === undefined) {
+      dirMap = new Map();
+      ctx.relCache.set(ctx.dir, dirMap);
+    }
+    path = dirMap.get(rel);
+    if (path === undefined) {
+      path = resolvePath(ctx.dirParts, ctx.dir, rel);
+      dirMap.set(rel, path);
+    }
+  }
+  if (path !== null) {
+    const targetSrc = ctx.bySource.get(path);
+    if (targetSrc !== undefined) {
+      const esc = escapeHtml(frag === '' ? targetSrc.url : `${targetSrc.url}${frag}`);
+      ctx.urlMap.set(target, esc);
+      return esc;
+    }
+    if (ctx.staticPaths.has(path)) {
+      const esc = escapeHtml(frag === '' ? `${ctx.base}/${path}` : `${ctx.base}/${path}${frag}`);
+      ctx.urlMap.set(target, esc);
+      return esc;
+    }
+  }
+  ctx.broken.add(`broken-link ${ctx.srcPath} -> ${target}`);
+  return escapeHtml(target);
+}
 
 // ---------------------------------------------------------------- Main entry
 
@@ -1364,7 +1445,9 @@ export function run(input) {
   for (let i = 0; i < statics.length; i++) staticPaths.add(statics[i].path);
   const broken = new Set();
   const dirPartsCache = new Map();
+  const urlCaches = new Map();
   const emptyParts = [];
+  const linkCtx = { srcPath: '', dir: '', dirParts: emptyParts, bySource, staticPaths, base, broken, relCache: new Map(), urlMap: null };
   for (let i = 0; i < kept.length; i++) {
     const s = kept[i];
     const dir = dirOf(s.path);
@@ -1373,22 +1456,16 @@ export function run(input) {
       dirParts = dir.split('/');
       dirPartsCache.set(dir, dirParts);
     }
-    const resolveLink = (target) => {
-      const c0 = target.charCodeAt(0);
-      if (c0 === 47 || c0 === 35 || (target.includes(':') && SCHEME_RE.test(target))) return target;
-      const hash = target.indexOf('#');
-      const rel = hash === -1 ? target : target.slice(0, hash);
-      const frag = hash === -1 ? '' : target.slice(hash);
-      const path = rel === '' ? null : resolvePath(dirParts, dir, rel);
-      if (path !== null) {
-        const targetSrc = bySource.get(path);
-        if (targetSrc !== undefined) return `${targetSrc.url}${frag}`;
-        if (staticPaths.has(path)) return `${base}/${path}${frag}`;
-      }
-      broken.add(`broken-link ${s.path} -> ${target}`);
-      return target;
-    };
-    const md = renderMarkdown(s.body, resolveLink, slugify);
+    let urlMap = urlCaches.get(dir);
+    if (urlMap === undefined) {
+      urlMap = new Map();
+      urlCaches.set(dir, urlMap);
+    }
+    linkCtx.srcPath = s.path;
+    linkCtx.dir = dir;
+    linkCtx.dirParts = dirParts;
+    linkCtx.urlMap = urlMap;
+    const md = renderMarkdown(s.body, resolveLinkCtx, linkCtx, slugify);
     s.html = md.html;
     s.toc = md.toc;
     s.excerpt = md.excerpt;
@@ -1407,29 +1484,20 @@ export function run(input) {
 
   // 6. Tags
   const bySlug = new Map();
-  const ownTags = (s) => {
-    const rawTags = s.data.tags;
-    if (rawTags === undefined || rawTags.length === 0) return [];
-    const seen = new Set();
-    const res = [];
-    for (let i = 0; i < rawTags.length; i++) {
-      const name = rawTags[i];
-      const sl = slugify(name);
-      if (!seen.has(sl)) {
-        seen.add(sl);
-        res.push(name);
-      }
-    }
-    return res;
-  };
-
   for (let i = 0; i < posts.length; i++) {
     const p = posts[i];
-    const pTags = ownTags(p);
-    p.tagRefs = new Array(pTags.length);
-    for (let j = 0; j < pTags.length; j++) {
-      const name = pTags[j];
+    const rawTags = p.data.tags;
+    if (rawTags === undefined || rawTags.length === 0) {
+      p.tagRefs = [];
+      continue;
+    }
+    const refs = [];
+    const seen = new Set();
+    for (let j = 0; j < rawTags.length; j++) {
+      const name = rawTags[j];
       const slug = slugify(name);
+      if (seen.has(slug)) continue;
+      seen.add(slug);
       let tag = bySlug.get(slug);
       if (tag === undefined) {
         const url = `${base}/tags/${slug}/`;
@@ -1437,55 +1505,80 @@ export function run(input) {
         bySlug.set(slug, tag);
       }
       tag.posts.push(p);
-      p.tagRefs[j] = tag.pub;
+      refs.push(tag.pub);
     }
+    p.tagRefs = refs;
   }
   for (let i = 0; i < kept.length; i++) {
     const s = kept[i];
     if (!s.post) {
-      const sTags = ownTags(s);
-      s.tagRefs = new Array(sTags.length);
-      for (let j = 0; j < sTags.length; j++) {
-        const name = sTags[j];
-        const slug = slugify(name);
-        const existing = bySlug.get(slug);
-        s.tagRefs[j] = existing !== undefined ? existing.pub : { __proto__: null, name, slug, url: '' };
+      const rawTags = s.data.tags;
+      if (rawTags === undefined || rawTags.length === 0) {
+        s.tagRefs = [];
+        continue;
       }
+      const refs = [];
+      const seen = new Set();
+      for (let j = 0; j < rawTags.length; j++) {
+        const name = rawTags[j];
+        const slug = slugify(name);
+        if (seen.has(slug)) continue;
+        seen.add(slug);
+        const existing = bySlug.get(slug);
+        refs.push(existing !== undefined ? existing.pub : { __proto__: null, name, slug, url: '' });
+      }
+      s.tagRefs = refs;
     }
   }
   const tagsList = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.slug, y.slug));
 
   // 7. Layouts
-  const linkOf = (s) => (s === null ? null : {
-    __proto__: null,
-    title: s.data.title,
-    url: s.url,
-    date: s.data.date ?? '',
-    date_long: s.data.date === undefined ? '' : longDate(s.data.date),
-  });
+  const dateCache = new Map();
+  const cachedLongDate = (d) => {
+    let ld = dateCache.get(d);
+    if (ld === undefined) {
+      ld = longDate(d);
+      dateCache.set(d, ld);
+    }
+    return ld;
+  };
+  const linkOf = (s) => {
+    if (s === null) return null;
+    if (s.link !== undefined) return s.link;
+    const dl = s.data.date === undefined ? '' : cachedLongDate(s.data.date);
+    s.dateLong = dl;
+    s.link = {
+      __proto__: null,
+      title: s.data.title,
+      url: s.url,
+      date: s.data.date ?? '',
+      date_long: dl,
+    };
+    return s.link;
+  };
 
-  const cardOf = (s) => ({
-    __proto__: null,
-    title: s.data.title,
-    url: s.url,
-    date: s.data.date ?? '',
-    date_long: s.data.date === undefined ? '' : longDate(s.data.date),
-    summary: s.data.summary ?? '',
-    excerpt: s.excerpt,
-    reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
-    tags: s.tagRefs,
-  });
-
-  const cards = new Map();
   for (let i = 0; i < posts.length; i++) {
-    cards.set(posts[i], cardOf(posts[i]));
+    const p = posts[i];
+    const dl = p.data.date === undefined ? '' : cachedLongDate(p.data.date);
+    p.dateLong = dl;
+    p.card = {
+      __proto__: null,
+      title: p.data.title,
+      url: p.url,
+      date: p.data.date ?? '',
+      date_long: dl,
+      summary: p.data.summary ?? '',
+      excerpt: p.excerpt,
+      reading_minutes: Math.max(1, Math.ceil(wordsOf(p.body) / 200)),
+      tags: p.tagRefs,
+    };
   }
 
   const site = { __proto__: null, title: input.site.title, base_url: base };
   const allTags = tagsList.map((t) => ({ __proto__: null, name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recentCount = Math.min(input.site.recent, posts.length);
   const recent = new Array(recentCount);
-  for (let i = 0; i < recentCount; i++) recent[i] = cards.get(posts[i]);
+  for (let i = 0; i < recentCount; i++) recent[i] = posts[i].card;
 
   const staticEnv = { __proto__: null, site, tags: allTags, recent };
   const DYN_BY_KIND = {
@@ -1523,47 +1616,62 @@ export function run(input) {
   };
 
   const output = {};
+  const pageObj = {
+    __proto__: null,
+    title: '',
+    url: '',
+    date: '',
+    date_long: '',
+    summary: '',
+    excerpt: '',
+    reading_minutes: 0,
+    tags: null,
+    slug: '',
+    content: '',
+    toc: null,
+    newer: null,
+    older: null,
+    is_post: false,
+  };
+  const pageVars = { __proto__: null, site, tags: allTags, recent, page: pageObj };
   for (let i = 0; i < kept.length; i++) {
     const s = kept[i];
     const rObj = getRenderer('page', s.layout);
     const renderer = rObj.fn;
     const needsRm = rObj.needsRm;
-    const card = s.post ? cards.get(s) : null;
-    const tocArr = s.toc;
-    const page = card !== null ? {
-      __proto__: null,
-      title: card.title,
-      url: card.url,
-      date: card.date,
-      date_long: card.date_long,
-      summary: card.summary,
-      excerpt: card.excerpt,
-      reading_minutes: card.reading_minutes,
-      tags: card.tags,
-      slug: s.slug,
-      content: s.html,
-      toc: tocArr,
-      newer: linkOf(s.newer ?? null),
-      older: linkOf(s.older ?? null),
-      is_post: true,
-    } : {
-      __proto__: null,
-      title: s.data.title,
-      url: s.url,
-      date: s.data.date ?? '',
-      date_long: s.data.date === undefined ? '' : longDate(s.data.date),
-      summary: s.data.summary ?? '',
-      excerpt: s.excerpt,
-      reading_minutes: needsRm ? Math.max(1, Math.ceil(wordsOf(s.body) / 200)) : 0,
-      tags: s.tagRefs,
-      slug: s.slug,
-      content: s.html,
-      toc: tocArr,
-      newer: null,
-      older: null,
-      is_post: false,
-    };
-    output[`${s.outDir}/index.html`] = renderer({ __proto__: null, site, tags: allTags, recent, page });
+    if (s.post) {
+      const card = s.card;
+      pageObj.title = card.title;
+      pageObj.url = card.url;
+      pageObj.date = card.date;
+      pageObj.date_long = card.date_long;
+      pageObj.summary = card.summary;
+      pageObj.excerpt = card.excerpt;
+      pageObj.reading_minutes = card.reading_minutes;
+      pageObj.tags = card.tags;
+      pageObj.slug = s.slug;
+      pageObj.content = s.html;
+      pageObj.toc = s.toc;
+      pageObj.newer = linkOf(s.newer ?? null);
+      pageObj.older = linkOf(s.older ?? null);
+      pageObj.is_post = true;
+    } else {
+      pageObj.title = s.data.title;
+      pageObj.url = s.url;
+      pageObj.date = s.data.date ?? '';
+      pageObj.date_long = s.data.date === undefined ? '' : cachedLongDate(s.data.date);
+      pageObj.summary = s.data.summary ?? '';
+      pageObj.excerpt = s.excerpt;
+      pageObj.reading_minutes = needsRm ? Math.max(1, Math.ceil(wordsOf(s.body) / 200)) : 0;
+      pageObj.tags = s.tagRefs;
+      pageObj.slug = s.slug;
+      pageObj.content = s.html;
+      pageObj.toc = s.toc;
+      pageObj.newer = null;
+      pageObj.older = null;
+      pageObj.is_post = false;
+    }
+    output[`${s.outDir}/index.html`] = renderer(pageVars);
   }
 
   const indexRenderer = getRenderer('index', 'index')?.fn ?? null;
@@ -1571,36 +1679,36 @@ export function run(input) {
     const per = input.site.per_page;
     const pages = Math.max(1, Math.ceil(posts.length / per));
     const indexUrl = (k) => (k === 1 ? `${base}/` : `${base}/page/${k}/`);
+    const pagerObj = { __proto__: null, number: 0, total: pages, url: '', newer_url: '', older_url: '' };
+    const indexVars = { __proto__: null, site, tags: allTags, recent, posts: null, pager: pagerObj };
     for (let k = 1; k <= pages; k++) {
       const start = (k - 1) * per;
       const end = Math.min(k * per, posts.length);
       const pagePosts = new Array(Math.max(0, end - start));
-      for (let i = start; i < end; i++) pagePosts[i - start] = cards.get(posts[i]);
-      const pager = {
-        __proto__: null,
-        number: k,
-        total: pages,
-        url: indexUrl(k),
-        newer_url: k === 1 ? '' : indexUrl(k - 1),
-        older_url: k === pages ? '' : indexUrl(k + 1),
-      };
-      output[k === 1 ? 'index.html' : `page/${k}/index.html`] = indexRenderer({ __proto__: null, site, tags: allTags, recent, posts: pagePosts, pager });
+      for (let i = start; i < end; i++) pagePosts[i - start] = posts[i].card;
+      pagerObj.number = k;
+      pagerObj.url = indexUrl(k);
+      pagerObj.newer_url = k === 1 ? '' : indexUrl(k - 1);
+      pagerObj.older_url = k === pages ? '' : indexUrl(k + 1);
+      indexVars.posts = pagePosts;
+      output[k === 1 ? 'index.html' : `page/${k}/index.html`] = indexRenderer(indexVars);
     }
   }
 
   const tagRenderer = getRenderer('tag', 'tag')?.fn ?? null;
   if (tagRenderer !== null) {
+    const tagObj = { __proto__: null, name: '', slug: '', url: '', count: 0, posts: null };
+    const tagVars = { __proto__: null, site, tags: allTags, recent, tag: tagObj };
     for (let i = 0; i < tagsList.length; i++) {
       const t = tagsList[i];
       const tPosts = new Array(t.posts.length);
-      for (let j = 0; j < t.posts.length; j++) tPosts[j] = cards.get(t.posts[j]);
-      output[`tags/${t.slug}/index.html`] = tagRenderer({
-        __proto__: null,
-        site,
-        tags: allTags,
-        recent,
-        tag: { __proto__: null, name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: tPosts },
-      });
+      for (let j = 0; j < t.posts.length; j++) tPosts[j] = t.posts[j].card;
+      tagObj.name = t.name;
+      tagObj.slug = t.slug;
+      tagObj.url = t.url;
+      tagObj.count = t.posts.length;
+      tagObj.posts = tPosts;
+      output[`tags/${t.slug}/index.html`] = tagRenderer(tagVars);
     }
   }
 
