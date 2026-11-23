@@ -11,14 +11,6 @@ function byCodeUnits(a, b) {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-const ESC_TEST = /[&<>"']/;
-const ESC_RE = /[&<>"']/g;
-const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-const escRepl = (m) => ESC_MAP[m];
-
-function escapeHtml(s) {
-  return ESC_TEST.test(s) ? s.replace(ESC_RE, escRepl) : s;
-}
 const JESC_TEST = /[\\"\x00-\x1f]/;
 const JESC_RE = /[\\"\x00-\x1f]/g;
 function jEscRepl(ch) {
@@ -125,22 +117,13 @@ function longDate(date) {
   return `${d} ${MONTHS[m - 1]} ${y}`;
 }
 
-const WS_TBL = new Uint8Array(128);
-WS_TBL[32] = 1; WS_TBL[9] = 1; WS_TBL[10] = 1; WS_TBL[11] = 1; WS_TBL[12] = 1; WS_TBL[13] = 1;
-
-function isJsWhitespace(c) {
-  if (c < 128) return WS_TBL[c] === 1;
-  return (
-    c === 0xa0 ||
-    c === 0x1680 ||
-    (c >= 0x2000 && c <= 0x200a) ||
-    c === 0x2028 ||
-    c === 0x2029 ||
-    c === 0x202f ||
-    c === 0x205f ||
-    c === 0x3000 ||
-    c === 0xfeff
-  );
+const WS_U16 = new Uint8Array(65536);
+for (const cp of [
+  9, 10, 11, 12, 13, 32, 0xa0, 0x1680,
+  0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a,
+  0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff,
+]) {
+  WS_U16[cp] = 1;
 }
 
 function wordsOf(text) {
@@ -148,8 +131,7 @@ function wordsOf(text) {
   let count = 0;
   let inWord = 0;
   for (let i = 0; i < len; i++) {
-    const c = text.charCodeAt(i);
-    const ws = c < 128 ? WS_TBL[c] : (isJsWhitespace(c) ? 1 : 0);
+    const ws = WS_U16[text.charCodeAt(i)];
     if ((inWord | ws) === 0) count++;
     inWord = ws ^ 1;
   }
@@ -158,16 +140,13 @@ function wordsOf(text) {
 
 function hasWhitespace(s) {
   for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    if (c === 32 || (c >= 9 && c <= 13) || (c >= 128 && isJsWhitespace(c))) return true;
+    if (WS_U16[s.charCodeAt(i)] === 1) return true;
   }
   return false;
 }
 
-// ---------------------------------------------------------------- Front matter
+// ---------------------------------------------------------------- Front matter (zero-alloc)
 
-const FM_KEYS = new Set(['title', 'date', 'tags', 'draft', 'layout', 'slug', 'summary']);
-const DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const NAME_RE = /^[a-z0-9-]+$/;
 const SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const TAG_RE = /^[^"[\]]+$/;
@@ -177,9 +156,10 @@ function daysIn(y, m) {
   return m === 4 || m === 6 || m === 9 || m === 11 ? 30 : 31;
 }
 
-function stringOf(raw) {
+let fmStrVal = '';
+function parseFmString(raw) {
   if (raw.charCodeAt(0) === 34) {
-    if (raw.length < 2 || raw.charCodeAt(raw.length - 1) !== 34) return { error: 'a quoted string is not closed' };
+    if (raw.length < 2 || raw.charCodeAt(raw.length - 1) !== 34) return 'a quoted string is not closed';
     let out = '';
     let last = 1;
     const end = raw.length - 1;
@@ -188,77 +168,87 @@ function stringOf(raw) {
       if (c === 92) {
         const n = raw.charCodeAt(i + 1);
         if ((n !== 34 && n !== 92) || i + 1 === end) {
-          return { error: 'a quoted string holds an escape other than \\" or \\\\' };
+          return 'a quoted string holds an escape other than \\" or \\\\';
         }
         if (i > last) out += raw.slice(last, i);
         out += raw[i + 1];
         i++;
         last = i + 1;
       } else if (c === 34) {
-        return { error: 'a quoted string holds a stray quote' };
+        return 'a quoted string holds a stray quote';
       }
     }
-    if (last === 1) return { value: raw.slice(1, end) };
-    if (last < end) out += raw.slice(last, end);
-    return { value: out };
+    if (last === 1) fmStrVal = raw.slice(1, end);
+    else fmStrVal = last < end ? out + raw.slice(last, end) : out;
+    return null;
   }
-  if (raw.charCodeAt(0) === 91) return { error: 'a bare string opens on [' };
-  return { value: raw };
+  if (raw.charCodeAt(0) === 91) return 'a bare string opens on [';
+  fmStrVal = raw;
+  return null;
 }
 
-function fmValueOf(key, raw) {
-  switch (key) {
-    case 'title':
-    case 'summary': {
-      const s = stringOf(raw);
-      return 'error' in s ? { error: `key "${key}": ${s.error}` } : s;
-    }
-    case 'date': {
-      if (raw.length === 10 && raw.charCodeAt(4) === 45 && raw.charCodeAt(7) === 45) {
-        const y0 = raw.charCodeAt(0) - 48, y1 = raw.charCodeAt(1) - 48, y2 = raw.charCodeAt(2) - 48, y3 = raw.charCodeAt(3) - 48;
-        const m0 = raw.charCodeAt(5) - 48, m1 = raw.charCodeAt(6) - 48;
-        const d0 = raw.charCodeAt(8) - 48, d1 = raw.charCodeAt(9) - 48;
-        if ((y0 | y1 | y2 | y3 | m0 | m1 | d0 | d1) >= 0 && y0 <= 9 && y1 <= 9 && y2 <= 9 && y3 <= 9 && m0 <= 9 && m1 <= 9 && d0 <= 9 && d1 <= 9) {
-          const y = y0 * 1000 + y1 * 100 + y2 * 10 + y3;
-          const mo = m0 * 10 + m1;
-          const d = d0 * 10 + d1;
-          if (y >= 1970 && y <= 2099 && mo >= 1 && mo <= 12 && d >= 1 && d <= daysIn(y, mo)) {
-            return { value: raw };
-          }
+function parseFmValue(key, raw, data) {
+  if (key === 'title' || key === 'summary') {
+    const err = parseFmString(raw);
+    if (err !== null) return `key "${key}": ${err}`;
+    data[key] = fmStrVal;
+    return null;
+  }
+  if (key === 'date') {
+    if (raw.length === 10 && raw.charCodeAt(4) === 45 && raw.charCodeAt(7) === 45) {
+      const y0 = raw.charCodeAt(0) - 48, y1 = raw.charCodeAt(1) - 48, y2 = raw.charCodeAt(2) - 48, y3 = raw.charCodeAt(3) - 48;
+      const m0 = raw.charCodeAt(5) - 48, m1 = raw.charCodeAt(6) - 48;
+      const d0 = raw.charCodeAt(8) - 48, d1 = raw.charCodeAt(9) - 48;
+      if ((y0 | y1 | y2 | y3 | m0 | m1 | d0 | d1) >= 0 && y0 <= 9 && y1 <= 9 && y2 <= 9 && y3 <= 9 && m0 <= 9 && m1 <= 9 && d0 <= 9 && d1 <= 9) {
+        const y = y0 * 1000 + y1 * 100 + y2 * 10 + y3;
+        const mo = m0 * 10 + m1;
+        const d = d0 * 10 + d1;
+        if (y >= 1970 && y <= 2099 && mo >= 1 && mo <= 12 && d >= 1 && d <= daysIn(y, mo)) {
+          data.date = raw;
+          return null;
         }
       }
-      return { error: 'key "date": not a date from 1970-01-01 to 2099-12-31 (YYYY-MM-DD)' };
     }
-    case 'tags': {
-      if (raw.charCodeAt(0) !== 91 || raw.charCodeAt(raw.length - 1) !== 93) return { error: 'key "tags": not a list [a, b]' };
-      const inner = raw.slice(1, -1);
-      if (inner.trim() === '') return { value: [] };
-      const parts = inner.split(',');
-      const tags = new Array(parts.length);
-      for (let i = 0; i < parts.length; i++) {
-        const t = parts[i].trim();
-        if (t === '' || !TAG_RE.test(t)) return { error: 'key "tags": an empty tag, or one holding " [ or ]' };
-        tags[i] = t;
-      }
-      return { value: tags };
-    }
-    case 'draft':
-      return raw === 'true' ? { value: true } : raw === 'false' ? { value: false } : { error: 'key "draft": true or false' };
-    case 'layout':
-      return NAME_RE.test(raw) ? { value: raw } : { error: 'key "layout": not a template name' };
-    case 'slug':
-      return SLUG_RE.test(raw) && raw.length <= 64 ? { value: raw } : { error: 'key "slug": not a slug' };
-    default:
-      return { error: `unknown key "${key}"` };
+    return 'key "date": not a date from 1970-01-01 to 2099-12-31 (YYYY-MM-DD)';
   }
+  if (key === 'tags') {
+    if (raw.charCodeAt(0) !== 91 || raw.charCodeAt(raw.length - 1) !== 93) return 'key "tags": not a list [a, b]';
+    const inner = raw.slice(1, -1);
+    if (inner.trim() === '') { data.tags = []; return null; }
+    const parts = inner.split(',');
+    const tags = new Array(parts.length);
+    for (let i = 0; i < parts.length; i++) {
+      const t = parts[i].trim();
+      if (t === '' || !TAG_RE.test(t)) return 'key "tags": an empty tag, or one holding " [ or ]';
+      tags[i] = t;
+    }
+    data.tags = tags;
+    return null;
+  }
+  if (key === 'draft') {
+    if (raw === 'true') { data.draft = true; return null; }
+    if (raw === 'false') { data.draft = false; return null; }
+    return 'key "draft": true or false';
+  }
+  if (key === 'layout') {
+    if (NAME_RE.test(raw)) { data.layout = raw; return null; }
+    return 'key "layout": not a template name';
+  }
+  if (key === 'slug') {
+    if (SLUG_RE.test(raw) && raw.length <= 64) { data.slug = raw; return null; }
+    return 'key "slug": not a slug';
+  }
+  return `unknown key "${key}"`;
 }
 
+let fmData = null;
+let fmBody = '';
 function parseFrontMatter(text) {
   const len = text.length;
   const nl0 = text.indexOf('\n');
-  if (nl0 === -1) return text === '---' ? { error: 'the front matter is not closed' } : { error: 'no front matter' };
+  if (nl0 === -1) return text === '---' ? 'the front matter is not closed' : 'no front matter';
   if (nl0 !== 3 || text.charCodeAt(0) !== 45 || text.charCodeAt(1) !== 45 || text.charCodeAt(2) !== 45) {
-    return { error: 'no front matter' };
+    return 'no front matter';
   }
 
   const data = {
@@ -277,9 +267,10 @@ function parseFrontMatter(text) {
     const nl = text.indexOf('\n', pos);
     const end = nl === -1 ? len : nl;
     if (end - pos === 3 && text.charCodeAt(pos) === 45 && text.charCodeAt(pos + 1) === 45 && text.charCodeAt(pos + 2) === 45) {
-      if ((mask & 1) === 0) return { error: 'no title' };
-      const body = nl === -1 ? '' : text.slice(nl + 1);
-      return { data, body };
+      if ((mask & 1) === 0) return 'no title';
+      fmData = data;
+      fmBody = nl === -1 ? '' : text.slice(nl + 1);
+      return null;
     }
     if (!startIsBlank(text, pos, end) && text.charCodeAt(pos) !== 35) {
       let colon = -1;
@@ -294,8 +285,8 @@ function parseFrontMatter(text) {
           validKey = false;
         }
       }
-      if (colon <= pos || !validKey) return { error: `line ${lineIdx + 1} is not "key: value"` };
-      if (colon + 1 < end && text.charCodeAt(colon + 1) !== 32) return { error: `line ${lineIdx + 1} is not "key: value"` };
+      if (colon <= pos || !validKey) return `line ${lineIdx + 1} is not "key: value"`;
+      if (colon + 1 < end && text.charCodeAt(colon + 1) !== 32) return `line ${lineIdx + 1} is not "key: value"`;
       const key = text.slice(pos, colon);
       let rawEnd = end;
       while (rawEnd > colon + 2 && (text.charCodeAt(rawEnd - 1) === 32 || text.charCodeAt(rawEnd - 1) === 9)) rawEnd--;
@@ -308,28 +299,55 @@ function parseFrontMatter(text) {
       else if (key === 'layout') bit = 16;
       else if (key === 'slug') bit = 32;
       else if (key === 'summary') bit = 64;
-      else return { error: `unknown key "${key}"` };
-      if ((mask & bit) !== 0) return { error: `key "${key}" is given twice` };
-      if (raw === '') return { error: `key "${key}" has no value` };
-      const v = fmValueOf(key, raw);
-      if ('error' in v) return v;
+      else return `unknown key "${key}"`;
+      if ((mask & bit) !== 0) return `key "${key}" is given twice`;
+      if (raw === '') return `key "${key}" has no value`;
+      const err = parseFmValue(key, raw, data);
+      if (err !== null) return err;
       mask |= bit;
-      data[key] = v.value;
     }
     if (nl === -1) break;
     pos = nl + 1;
     lineIdx++;
   }
-  return { error: 'the front matter is not closed' };
+  return 'the front matter is not closed';
 }
 
-// ---------------------------------------------------------------- Markdown
+// ---------------------------------------------------------------- Markdown helpers
 
 const ESCAPABLE = new Uint8Array(128);
 for (const ch of '\\`*_[]()#+-.!>') ESCAPABLE[ch.charCodeAt(0)] = 1;
 
 const PARA_STOP = new Uint8Array(128);
 for (const ch of ' \t`#-*') PARA_STOP[ch.charCodeAt(0)] = 1;
+
+const BLANK_RE = /^[ \t]*$/;
+
+const INLINE_J_TBL = new Uint8Array(128);
+for (let i = 0; i < 32; i++) INLINE_J_TBL[i] = 1;
+INLINE_J_TBL[34] = 1;
+INLINE_J_TBL[38] = 1;
+INLINE_J_TBL[39] = 1;
+INLINE_J_TBL[42] = 1;
+INLINE_J_TBL[60] = 1;
+INLINE_J_TBL[62] = 1;
+INLINE_J_TBL[91] = 1;
+INLINE_J_TBL[92] = 1;
+INLINE_J_TBL[96] = 1;
+
+const ESC_J_TBL = new Uint8Array(128);
+for (let i = 0; i < 32; i++) ESC_J_TBL[i] = 1;
+ESC_J_TBL[34] = 1;
+ESC_J_TBL[38] = 1;
+ESC_J_TBL[39] = 1;
+ESC_J_TBL[60] = 1;
+ESC_J_TBL[62] = 1;
+ESC_J_TBL[92] = 1;
+
+const J_ESC_TBL = new Uint8Array(128);
+for (let i = 0; i < 32; i++) J_ESC_TBL[i] = 1;
+J_ESC_TBL[34] = 1;
+J_ESC_TBL[92] = 1;
 
 function findUnescaped(s, what, from, end) {
   const limit = end - what.length;
@@ -364,124 +382,6 @@ function findSingleStar(s, from, end) {
   }
   return -1;
 }
-
-const ALL_RE = /[\\`*[&<>"']/g;
-const MD_ONLY_RE = /[\\`*[]/g;
-
-function inlineRange(s, start, end, resolveLink, linkCtx) {
-  if (start >= end) return '';
-  ALL_RE.lastIndex = start;
-  if (!ALL_RE.test(s) || ALL_RE.lastIndex - 1 >= end) {
-    return start === 0 && end === s.length ? s : s.slice(start, end);
-  }
-  const firstIdx = ALL_RE.lastIndex - 1;
-  MD_ONLY_RE.lastIndex = firstIdx;
-  if (!MD_ONLY_RE.test(s) || MD_ONLY_RE.lastIndex - 1 >= end) {
-    const sub = start === 0 && end === s.length ? s : s.slice(start, end);
-    return sub.replace(ESC_RE, escRepl);
-  }
-  const sl = s.indexOf('\\', MD_ONLY_RE.lastIndex - 1);
-  return inlineRec(s, start, end, resolveLink, linkCtx, sl !== -1 && sl < end, firstIdx);
-}
-
-function inlineRec(s, start, end, resolveLink, linkCtx, hasSlash, firstIdx) {
-  let idx = firstIdx;
-  if (idx === -1) {
-    ALL_RE.lastIndex = start;
-    if (!ALL_RE.test(s) || ALL_RE.lastIndex - 1 >= end) {
-      return start === 0 && end === s.length ? s : s.slice(start, end);
-    }
-    idx = ALL_RE.lastIndex - 1;
-  }
-  let out = idx > start ? s.slice(start, idx) : '';
-  let i = idx;
-  while (true) {
-    const c = s.charCodeAt(idx);
-    if (c <= 62) {
-      if (c === 42) {
-        if (idx + 1 < end && s.charCodeAt(idx + 1) === 42) {
-          const j = findUnescaped(s, '**', idx + 2, end, hasSlash);
-          if (j > idx + 2) {
-            out += `<strong>${inlineRec(s, idx + 2, j, resolveLink, linkCtx, hasSlash, -1)}</strong>`;
-            i = j + 2;
-          } else {
-            out += '**';
-            i = idx + 2;
-          }
-        } else {
-          const j = findSingleStar(s, idx + 1, end, hasSlash);
-          if (j > idx + 1) {
-            out += `<em>${inlineRec(s, idx + 1, j, resolveLink, linkCtx, hasSlash, -1)}</em>`;
-            i = j + 1;
-          } else {
-            out += '*';
-            i = idx + 1;
-          }
-        }
-      } else if (c === 39) {
-        out += '&#39;';
-        i = idx + 1;
-      } else if (c === 34) {
-        out += '&quot;';
-        i = idx + 1;
-      } else if (c === 38) {
-        out += '&amp;';
-        i = idx + 1;
-      } else if (c === 60) {
-        out += '&lt;';
-        i = idx + 1;
-      } else {
-        out += '&gt;';
-        i = idx + 1;
-      }
-    } else if (c === 92) {
-      if (idx + 1 < end) {
-        const nc = s.charCodeAt(idx + 1);
-        if (nc < 128 && ESCAPABLE[nc]) {
-          out += nc === 62 ? '&gt;' : s[idx + 1];
-          i = idx + 2;
-        } else {
-          out += '\\';
-          i = idx + 1;
-        }
-      } else {
-        out += '\\';
-        i = idx + 1;
-      }
-    } else if (c === 96) {
-      const j = s.indexOf('`', idx + 1);
-      if (j > idx + 1 && j < end) {
-        out += `<code>${escapeHtml(s.slice(idx + 1, j))}</code>`;
-        i = j + 1;
-      } else {
-        out += '`';
-        i = idx + 1;
-      }
-    } else {
-      const k = findUnescaped(s, ']', idx + 1, end, hasSlash);
-      const m = k !== -1 && k + 1 < end && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
-      const target = m !== -1 && m < end ? s.slice(k + 2, m) : '';
-      if (target !== '' && !hasWhitespace(target)) {
-        out += `<a href="${resolveLink(linkCtx, target)}">${inlineRec(s, idx + 1, k, resolveLink, linkCtx, hasSlash, -1)}</a>`;
-        i = m + 1;
-      } else {
-        out += '[';
-        i = idx + 1;
-      }
-    }
-    if (i >= end) break;
-    ALL_RE.lastIndex = i;
-    if (!ALL_RE.test(s) || ALL_RE.lastIndex - 1 >= end) {
-      out += s.slice(i, end);
-      break;
-    }
-    idx = ALL_RE.lastIndex - 1;
-    if (idx > i) out += s.slice(i, idx);
-  }
-  return out;
-}
-
-const BLANK_RE = /^[ \t]*$/;
 
 function isBlankSlice(src, start, end) {
   for (let i = start; i < end; i++) {
@@ -556,16 +456,6 @@ function isContinuedSlice(src, pos, end) {
   return c !== 32 && !(c >= 9 && c <= 13);
 }
 
-function endsParagraph(src, start, end) {
-  if (start === end) return true;
-  const c0 = src.charCodeAt(start);
-  if (c0 >= 128 || !PARA_STOP[c0]) return false;
-  if (c0 === 32 || c0 === 9) return isBlankSlice(src, start, end);
-  if (c0 === 96) return fenceLangEnd(src, start, end) !== -1;
-  if (c0 === 35) return headingDepthSlice(src, start, end) !== 0;
-  return isHrSlice(src, start, end, c0);
-}
-
 function startIsBlank(src, pos, end) {
   if (pos === end) return true;
   const c0 = src.charCodeAt(pos);
@@ -573,508 +463,7 @@ function startIsBlank(src, pos, end) {
   return isBlankSlice(src, pos + 1, end);
 }
 
-function renderMarkdown(src, resolveLink, linkCtx, slugify) {
-  const srcLen = src.length;
-  const ids = new Set();
-  const toc = [];
-  let excerpt = null;
-  let out = '';
-  let pos = 0;
-
-  while (pos <= srcLen) {
-    const nl = src.indexOf('\n', pos);
-    const end = nl === -1 ? srcLen : nl;
-    if (startIsBlank(src, pos, end)) {
-      if (nl === -1) break;
-      pos = nl + 1;
-      continue;
-    }
-
-    const c0 = src.charCodeAt(pos);
-    const nextPos = nl === -1 ? srcLen + 1 : nl + 1;
-
-    if (c0 === 96) {
-      const langEnd = fenceLangEnd(src, pos, end);
-      if (langEnd !== -1) {
-        const openTag = langEnd === pos + 3 ? '<pre><code>' : `<pre><code class="language-${escapeHtml(src.slice(pos + 3, langEnd))}">`;
-        pos = nextPos;
-        const codeStart = pos;
-        let closed = false;
-        let codeEnd = pos;
-        while (pos <= srcLen) {
-          const nl2 = src.indexOf('\n', pos);
-          const end2 = nl2 === -1 ? srcLen : nl2;
-          if (isFenceCloseSlice(src, pos, end2)) {
-            codeEnd = pos;
-            pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
-            closed = true;
-            break;
-          }
-          pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
-        }
-        const body = closed
-          ? (codeEnd > codeStart ? escapeHtml(src.slice(codeStart, codeEnd)) : '')
-          : (codeStart <= srcLen ? `${escapeHtml(src.slice(codeStart))}\n` : '');
-        out += `${openTag}${body}</code></pre>\n`;
-        continue;
-      }
-    }
-
-    if (c0 === 35) {
-      let d = 0;
-      const max = Math.min(end, pos + 6);
-      while (pos + d < max && src.charCodeAt(pos + d) === 35) d++;
-      if (d > 0 && pos + d < end) {
-        const sp = src.charCodeAt(pos + d);
-        if (sp === 32 || sp === 9) {
-          let hs = pos + d + 1;
-          while (hs < end && (src.charCodeAt(hs) === 32 || src.charCodeAt(hs) === 9)) hs++;
-          let he = end;
-          while (he > hs && (src.charCodeAt(he - 1) === 32 || src.charCodeAt(he - 1) === 9)) he--;
-          if (hs < he) {
-            const id = uniqueSlug(slugify(src.slice(hs, he)), ids);
-            const html = inlineRange(src, hs, he, resolveLink, linkCtx);
-            out += `<h${d} id="${id}">${html}</h${d}>\n`;
-            if (d === 2 || d === 3) toc.push({ __proto__: null, level: d, id, html });
-            pos = nextPos;
-            continue;
-          }
-        }
-      }
-    }
-
-    if (c0 === 45 || c0 === 42) {
-      if (isHrSlice(src, pos, end, c0)) {
-        out += '<hr>\n';
-        pos = nextPos;
-        continue;
-      }
-      if (pos + 1 < end && src.charCodeAt(pos + 1) === 32) {
-        let listHtml = '<ul>\n';
-        let curStart = pos + 2;
-        while (curStart < end && (src.charCodeAt(curStart) === 32 || src.charCodeAt(curStart) === 9)) curStart++;
-        let curEnd = end;
-        while (curEnd > curStart && (src.charCodeAt(curEnd - 1) === 32 || src.charCodeAt(curEnd - 1) === 9)) curEnd--;
-        let curItem = null;
-        pos = nextPos;
-        while (pos <= srcLen) {
-          const nl2 = src.indexOf('\n', pos);
-          const end2 = nl2 === -1 ? srcLen : nl2;
-          if (isBulletSlice(src, pos, end2)) {
-            listHtml += `<li>${curItem === null ? inlineRange(src, curStart, curEnd, resolveLink, linkCtx) : inlineRange(curItem, 0, curItem.length, resolveLink, linkCtx)}</li>\n`;
-            curStart = pos + 2;
-            while (curStart < end2 && (src.charCodeAt(curStart) === 32 || src.charCodeAt(curStart) === 9)) curStart++;
-            curEnd = end2;
-            while (curEnd > curStart && (src.charCodeAt(curEnd - 1) === 32 || src.charCodeAt(curEnd - 1) === 9)) curEnd--;
-            curItem = null;
-            pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
-          } else if (isContinuedSlice(src, pos, end2)) {
-            if (curItem === null) curItem = src.slice(curStart, curEnd);
-            curItem += `\n${trimSlice(src, pos, end2)}`;
-            pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
-          } else {
-            break;
-          }
-        }
-        const lastHtml = curItem === null ? inlineRange(src, curStart, curEnd, resolveLink, linkCtx) : inlineRange(curItem, 0, curItem.length, resolveLink, linkCtx);
-        out += `${listHtml}<li>${lastHtml}</li>\n</ul>\n`;
-        continue;
-      }
-    }
-
-    if (c0 === 62) {
-      let qText = '';
-      let first = true;
-      {
-        const s0 = pos + (pos + 1 < end && src.charCodeAt(pos + 1) === 32 ? 2 : 1);
-        const t0 = trimSlice(src, s0, end);
-        if (t0 !== '') {
-          qText = t0;
-          first = false;
-        }
-      }
-      pos = nextPos;
-      while (pos < srcLen && src.charCodeAt(pos) === 62) {
-        const nl2 = src.indexOf('\n', pos);
-        const end2 = nl2 === -1 ? srcLen : nl2;
-        const s2 = pos + (pos + 1 < end2 && src.charCodeAt(pos + 1) === 32 ? 2 : 1);
-        const t2 = trimSlice(src, s2, end2);
-        if (t2 !== '') {
-          if (first) {
-            qText = t2;
-            first = false;
-          } else {
-            qText += `\n${t2}`;
-          }
-        }
-        pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
-      }
-      out += first ? '<blockquote>\n</blockquote>\n' : `<blockquote>\n<p>${inlineRange(qText, 0, qText.length, resolveLink, linkCtx)}</p>\n</blockquote>\n`;
-      continue;
-    }
-
-    if (c0 >= 48 && c0 <= 57) {
-      const contentPos = orderedStartSlice(src, pos, end);
-      if (contentPos !== -1) {
-        const start = contentPos - 2 === pos + 1 ? src.charCodeAt(pos) - 48 : Number(src.slice(pos, contentPos - 2));
-        let listHtml = start !== 1 ? `<ol start="${start}">\n` : '<ol>\n';
-        let curStart = contentPos;
-        while (curStart < end && (src.charCodeAt(curStart) === 32 || src.charCodeAt(curStart) === 9)) curStart++;
-        let curEnd = end;
-        while (curEnd > curStart && (src.charCodeAt(curEnd - 1) === 32 || src.charCodeAt(curEnd - 1) === 9)) curEnd--;
-        let curItem = null;
-        pos = nextPos;
-        while (pos <= srcLen) {
-          const nl2 = src.indexOf('\n', pos);
-          const end2 = nl2 === -1 ? srcLen : nl2;
-          const cPos2 = orderedStartSlice(src, pos, end2);
-          if (cPos2 !== -1) {
-            listHtml += `<li>${curItem === null ? inlineRange(src, curStart, curEnd, resolveLink, linkCtx) : inlineRange(curItem, 0, curItem.length, resolveLink, linkCtx)}</li>\n`;
-            curStart = cPos2;
-            while (curStart < end2 && (src.charCodeAt(curStart) === 32 || src.charCodeAt(curStart) === 9)) curStart++;
-            curEnd = end2;
-            while (curEnd > curStart && (src.charCodeAt(curEnd - 1) === 32 || src.charCodeAt(curEnd - 1) === 9)) curEnd--;
-            curItem = null;
-            pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
-          } else if (isContinuedSlice(src, pos, end2)) {
-            if (curItem === null) curItem = src.slice(curStart, curEnd);
-            curItem += `\n${trimSlice(src, pos, end2)}`;
-            pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
-          } else {
-            break;
-          }
-        }
-        const lastHtml = curItem === null ? inlineRange(src, curStart, curEnd, resolveLink, linkCtx) : inlineRange(curItem, 0, curItem.length, resolveLink, linkCtx);
-        out += `${listHtml}<li>${lastHtml}</li>\n</ol>\n`;
-        continue;
-      }
-    }
-
-    const p0Trimmed = pos < end && (src.charCodeAt(pos) === 32 || src.charCodeAt(pos) === 9 || src.charCodeAt(end - 1) === 32 || src.charCodeAt(end - 1) === 9);
-    const pStart = pos;
-    let pLastEnd = end;
-    let pLines = p0Trimmed ? [trimSlice(src, pos, end)] : null;
-    pos = nextPos;
-    while (pos <= srcLen) {
-      const nl2 = src.indexOf('\n', pos);
-      const end2 = nl2 === -1 ? srcLen : nl2;
-      if (endsParagraph(src, pos, end2)) break;
-      const needTrim = pos < end2 && (src.charCodeAt(pos) === 32 || src.charCodeAt(pos) === 9 || src.charCodeAt(end2 - 1) === 32 || src.charCodeAt(end2 - 1) === 9);
-      if (pLines === null) {
-        if (needTrim) {
-          pLines = [src.slice(pStart, pLastEnd), trimSlice(src, pos, end2)];
-        } else {
-          pLastEnd = end2;
-        }
-      } else {
-        pLines.push(needTrim ? trimSlice(src, pos, end2) : src.slice(pos, end2));
-      }
-      pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
-    }
-    const html = pLines === null
-      ? inlineRange(src, pStart, pLastEnd, resolveLink, linkCtx)
-      : (() => { const t = pLines.join('\n'); return inlineRange(t, 0, t.length, resolveLink, linkCtx); })();
-    if (excerpt === null) excerpt = html;
-    out += `<p>${html}</p>\n`;
-  }
-  return { html: out, toc, excerpt: excerpt ?? '' };
-}
-
-
-
-const INLINE_J_TBL = new Uint8Array(128);
-for (let i = 0; i < 32; i++) INLINE_J_TBL[i] = 1;
-INLINE_J_TBL[34] = 1;
-INLINE_J_TBL[38] = 1;
-INLINE_J_TBL[39] = 1;
-INLINE_J_TBL[42] = 1;
-INLINE_J_TBL[60] = 1;
-INLINE_J_TBL[62] = 1;
-INLINE_J_TBL[91] = 1;
-INLINE_J_TBL[92] = 1;
-INLINE_J_TBL[96] = 1;
-
-const ESC_J_TBL = new Uint8Array(128);
-for (let i = 0; i < 32; i++) ESC_J_TBL[i] = 1;
-ESC_J_TBL[34] = 1;
-ESC_J_TBL[38] = 1;
-ESC_J_TBL[39] = 1;
-ESC_J_TBL[60] = 1;
-ESC_J_TBL[62] = 1;
-ESC_J_TBL[92] = 1;
-
-function escapeHtmlJSlice(s, start, end) {
-  let out = '';
-  let last = start;
-  for (let i = start; i < end; i++) {
-    const c = s.charCodeAt(i);
-    if (c >= 128 || ESC_J_TBL[c] === 0) continue;
-    if (i > last) out += s.slice(last, i);
-    if (c === 38) out += '&amp;';
-    else if (c === 60) out += '&lt;';
-    else if (c === 62) out += '&gt;';
-    else if (c === 34) out += '&quot;';
-    else if (c === 39) out += '&#39;';
-    else if (c === 92) out += '\\\\';
-    else if (c === 10) out += '\\n';
-    else if (c === 13) out += '\\r';
-    else if (c === 9) out += '\\t';
-    else if (c === 8) out += '\\b';
-    else if (c === 12) out += '\\f';
-    else out += c < 16 ? '\\u000' + c.toString(16) : '\\u00' + c.toString(16);
-    last = i + 1;
-  }
-  if (last === start) return start === 0 && end === s.length ? s : s.slice(start, end);
-  return last < end ? out + s.slice(last, end) : out;
-}
-
-function inlineTblJ(s, start, end, resolveLink, linkCtx) {
-  if (start >= end) return '';
-  let out = '';
-  let last = start;
-  let i = start;
-  while (i < end) {
-    const c = s.charCodeAt(i);
-    if (c >= 128 || INLINE_J_TBL[c] === 0) {
-      i++;
-      continue;
-    }
-    if (i > last) out += s.slice(last, i);
-    if (c === 42) {
-      if (i + 1 < end && s.charCodeAt(i + 1) === 42) {
-        const j = findUnescaped(s, '**', i + 2, end);
-        if (j > i + 2) {
-          out += '<strong>' + inlineTblJ(s, i + 2, j, resolveLink, linkCtx) + '</strong>';
-          i = j + 2;
-          last = i;
-          continue;
-        }
-        out += '**';
-        i += 2;
-        last = i;
-        continue;
-      }
-      const j = findSingleStar(s, i + 1, end);
-      if (j > i + 1) {
-        out += '<em>' + inlineTblJ(s, i + 1, j, resolveLink, linkCtx) + '</em>';
-        i = j + 1;
-        last = i;
-        continue;
-      }
-      out += '*';
-      i++;
-      last = i;
-      continue;
-    }
-    if (c === 96) {
-      const j = s.indexOf('`', i + 1);
-      if (j > i + 1 && j < end) {
-        out += '<code>' + escapeHtmlJSlice(s, i + 1, j) + '</code>';
-        i = j + 1;
-        last = i;
-        continue;
-      }
-      out += '`';
-      i++;
-      last = i;
-      continue;
-    }
-    if (c === 91) {
-      const k = findUnescaped(s, ']', i + 1, end);
-      const m = k !== -1 && k + 1 < end && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
-      const target = m !== -1 && m < end ? s.slice(k + 2, m) : '';
-      if (target !== '' && !hasWhitespace(target)) {
-        out += '<a href=\\"' + resolveLink(linkCtx, target) + '\\">' + inlineTblJ(s, i + 1, k, resolveLink, linkCtx) + '</a>';
-        i = m + 1;
-        last = i;
-        continue;
-      }
-      out += '[';
-      i++;
-      last = i;
-      continue;
-    }
-    if (c === 92) {
-      if (i + 1 < end) {
-        const nc = s.charCodeAt(i + 1);
-        if (nc < 128 && ESCAPABLE[nc]) {
-          out += nc === 62 ? '&gt;' : (nc === 92 ? '\\\\' : s[i + 1]);
-          i += 2;
-          last = i;
-          continue;
-        }
-      }
-      out += '\\\\';
-      i++;
-      last = i;
-      continue;
-    }
-    if (c === 38) out += '&amp;';
-    else if (c === 60) out += '&lt;';
-    else if (c === 62) out += '&gt;';
-    else if (c === 34) out += '&quot;';
-    else if (c === 39) out += '&#39;';
-    else if (c === 10) out += '\\n';
-    else if (c === 13) out += '\\r';
-    else if (c === 9) out += '\\t';
-    else if (c === 8) out += '\\b';
-    else if (c === 12) out += '\\f';
-    else out += c < 16 ? '\\u000' + c.toString(16) : '\\u00' + c.toString(16);
-    i++;
-    last = i;
-  }
-  if (last === start) return start === 0 && end === s.length ? s : s.slice(start, end);
-  return last < end ? out + s.slice(last, end) : out;
-}
-
-function renderMarkdownJ(src, resolveLink, linkCtx, slugify) {
-  const srcLen = src.length;
-  const ids = new Set();
-  const toc = [];
-  let excerpt = null;
-  let out = '';
-  let pos = 0;
-  while (pos <= srcLen) {
-    const nl = src.indexOf('\n', pos);
-    const end = nl === -1 ? srcLen : nl;
-    if (startIsBlank(src, pos, end)) { if (nl === -1) break; pos = nl + 1; continue; }
-    const c0 = src.charCodeAt(pos);
-    const nextPos = nl === -1 ? srcLen + 1 : nl + 1;
-    if (c0 === 96) {
-      const langEnd = fenceLangEnd(src, pos, end);
-      if (langEnd !== -1) {
-        const openTag = langEnd === pos + 3 ? '<pre><code>' : `<pre><code class=\\"language-${escapeHtmlJSlice(src, pos + 3, langEnd)}\\">`;
-        pos = nextPos; const codeStart = pos; let closed = false, codeEnd = pos;
-        while (pos <= srcLen) {
-          const nl2 = src.indexOf('\n', pos); const end2 = nl2 === -1 ? srcLen : nl2;
-          if (isFenceCloseSlice(src, pos, end2)) { codeEnd = pos; pos = nl2 === -1 ? srcLen + 1 : nl2 + 1; closed = true; break; }
-          pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
-        }
-        const body = closed ? (codeEnd > codeStart ? escapeHtmlJSlice(src, codeStart, codeEnd) : '') : (codeStart <= srcLen ? `${escapeHtmlJSlice(src, codeStart, srcLen)}\\n` : '');
-        out += `${openTag}${body}</code></pre>\\n`;
-        continue;
-      }
-    }
-    if (c0 === 35) {
-      let d = 0; const max = Math.min(end, pos + 6); while (pos + d < max && src.charCodeAt(pos + d) === 35) d++;
-      if (d > 0 && pos + d < end) {
-        const sp = src.charCodeAt(pos + d);
-        if (sp === 32 || sp === 9) {
-          let hs = pos + d + 1; while (hs < end && (src.charCodeAt(hs) === 32 || src.charCodeAt(hs) === 9)) hs++;
-          let he = end; while (he > hs && (src.charCodeAt(he - 1) === 32 || src.charCodeAt(he - 1) === 9)) he--;
-          if (hs < he) {
-            const id = uniqueSlug(slugify(src.slice(hs, he)), ids);
-            const html = inlineTblJ(src, hs, he, resolveLink, linkCtx);
-            out += `<h${d} id=\\"${id}\\">${html}</h${d}>\\n`;
-            if (d === 2 || d === 3) toc.push({ level: d, id, html });
-            pos = nextPos; continue;
-          }
-        }
-      }
-    }
-    if (c0 === 45 || c0 === 42) {
-      if (isHrSlice(src, pos, end, c0)) { out += '<hr>\\n'; pos = nextPos; continue; }
-      if (pos + 1 < end && src.charCodeAt(pos + 1) === 32) {
-        let listHtml = '<ul>\\n';
-        let curStart = pos + 2; while (curStart < end && (src.charCodeAt(curStart) === 32 || src.charCodeAt(curStart) === 9)) curStart++;
-        let curEnd = end; while (curEnd > curStart && (src.charCodeAt(curEnd - 1) === 32 || src.charCodeAt(curEnd - 1) === 9)) curEnd--;
-        let curItem = null; pos = nextPos;
-        while (pos <= srcLen) {
-          const nl2 = src.indexOf('\n', pos); const end2 = nl2 === -1 ? srcLen : nl2;
-          if (isBulletSlice(src, pos, end2)) {
-            listHtml += `<li>${curItem === null ? inlineTblJ(src, curStart, curEnd, resolveLink, linkCtx) : inlineTblJ(curItem, 0, curItem.length, resolveLink, linkCtx)}</li>\\n`;
-            curStart = pos + 2; while (curStart < end2 && (src.charCodeAt(curStart) === 32 || src.charCodeAt(curStart) === 9)) curStart++;
-            curEnd = end2; while (curEnd > curStart && (src.charCodeAt(curEnd - 1) === 32 || src.charCodeAt(curEnd - 1) === 9)) curEnd--;
-            curItem = null; pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
-          } else if (isContinuedSlice(src, pos, end2)) {
-            if (curItem === null) curItem = src.slice(curStart, curEnd);
-            curItem += `\n${trimSlice(src, pos, end2)}`; pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
-          } else break;
-        }
-        const lastHtml = curItem === null ? inlineTblJ(src, curStart, curEnd, resolveLink, linkCtx) : inlineTblJ(curItem, 0, curItem.length, resolveLink, linkCtx);
-        out += `${listHtml}<li>${lastHtml}</li>\\n</ul>\\n`; continue;
-      }
-    }
-    if (c0 === 62) {
-      let qText = ''; let first = true;
-      const s0 = pos + (pos + 1 < end && src.charCodeAt(pos + 1) === 32 ? 2 : 1);
-      const t0 = trimSlice(src, s0, end); if (t0 !== '') { qText = t0; first = false; }
-      pos = nextPos;
-      while (pos < srcLen && src.charCodeAt(pos) === 62) {
-        const nl2 = src.indexOf('\n', pos); const end2 = nl2 === -1 ? srcLen : nl2;
-        const s2 = pos + (pos + 1 < end2 && src.charCodeAt(pos + 1) === 32 ? 2 : 1);
-        const t2 = trimSlice(src, s2, end2); if (t2 !== '') { qText = first ? t2 : `${qText}\n${t2}`; first = false; }
-        pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
-      }
-      out += first ? '<blockquote>\\n</blockquote>\\n' : `<blockquote>\\n<p>${inlineTblJ(qText, 0, qText.length, resolveLink, linkCtx)}</p>\\n</blockquote>\\n`;
-      continue;
-    }
-    if (c0 >= 48 && c0 <= 57) {
-      const contentPos = orderedStartSlice(src, pos, end);
-      if (contentPos !== -1) {
-        const start = contentPos - 2 === pos + 1 ? c0 - 48 : Number(src.slice(pos, contentPos - 2));
-        let listHtml = start !== 1 ? `<ol start=\\"${start}\\">\\n` : '<ol>\\n';
-        let curStart = contentPos; while (curStart < end && (src.charCodeAt(curStart) === 32 || src.charCodeAt(curStart) === 9)) curStart++;
-        let curEnd = end; while (curEnd > curStart && (src.charCodeAt(curEnd - 1) === 32 || src.charCodeAt(curEnd - 1) === 9)) curEnd--;
-        let curItem = null; pos = nextPos;
-        while (pos <= srcLen) {
-          const nl2 = src.indexOf('\n', pos); const end2 = nl2 === -1 ? srcLen : nl2;
-          const cPos2 = orderedStartSlice(src, pos, end2);
-          if (cPos2 !== -1) {
-            listHtml += `<li>${curItem === null ? inlineTblJ(src, curStart, curEnd, resolveLink, linkCtx) : inlineTblJ(curItem, 0, curItem.length, resolveLink, linkCtx)}</li>\\n`;
-            curStart = cPos2; while (curStart < end2 && (src.charCodeAt(curStart) === 32 || src.charCodeAt(curStart) === 9)) curStart++;
-            curEnd = end2; while (curEnd > curStart && (src.charCodeAt(curEnd - 1) === 32 || src.charCodeAt(curEnd - 1) === 9)) curEnd--;
-            curItem = null; pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
-          } else if (isContinuedSlice(src, pos, end2)) {
-            if (curItem === null) curItem = src.slice(curStart, curEnd);
-            curItem += `\n${trimSlice(src, pos, end2)}`; pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
-          } else break;
-        }
-        const lastHtml = curItem === null ? inlineTblJ(src, curStart, curEnd, resolveLink, linkCtx) : inlineTblJ(curItem, 0, curItem.length, resolveLink, linkCtx);
-        out += `${listHtml}<li>${lastHtml}</li>\\n</ol>\\n`; continue;
-      }
-    }
-    let pStart = pos;
-    let pLastEnd = end;
-    let p0Trimmed = false;
-    if (pStart < pLastEnd && (c0 === 32 || c0 === 9)) {
-      p0Trimmed = true;
-      while (pStart < pLastEnd && (src.charCodeAt(pStart) === 32 || src.charCodeAt(pStart) === 9)) pStart++;
-    }
-    if (pLastEnd > pStart && (src.charCodeAt(pLastEnd - 1) === 32 || src.charCodeAt(pLastEnd - 1) === 9)) {
-      p0Trimmed = true;
-      while (pLastEnd > pStart && (src.charCodeAt(pLastEnd - 1) === 32 || src.charCodeAt(pLastEnd - 1) === 9)) pLastEnd--;
-    }
-    let pLines = null;
-    pos = nextPos;
-    while (pos <= srcLen) {
-      const nl2 = src.indexOf('\n', pos);
-      const end2 = nl2 === -1 ? srcLen : nl2;
-      if (pos === end2) break;
-      const lc = src.charCodeAt(pos);
-      if (lc < 128 && PARA_STOP[lc]) {
-        if (lc === 32 || lc === 9) { if (isBlankSlice(src, pos, end2)) break; }
-        else if (lc === 96) { if (fenceLangEnd(src, pos, end2) !== -1) break; }
-        else if (lc === 35) { if (headingDepthSlice(src, pos, end2) !== 0) break; }
-        else if (isHrSlice(src, pos, end2, lc)) break;
-      }
-      const needTrim = lc === 32 || lc === 9 || src.charCodeAt(end2 - 1) === 32 || src.charCodeAt(end2 - 1) === 9;
-      if (pLines === null) {
-        if (p0Trimmed || needTrim) pLines = [src.slice(pStart, pLastEnd), needTrim ? trimSlice(src, pos, end2) : src.slice(pos, end2)];
-        else pLastEnd = end2;
-      } else {
-        pLines.push(needTrim ? trimSlice(src, pos, end2) : src.slice(pos, end2));
-      }
-      pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
-    }
-    const html = pLines === null ? inlineTblJ(src, pStart, pLastEnd, resolveLink, linkCtx) : (() => { const t = pLines.join('\n'); return inlineTblJ(t, 0, t.length, resolveLink, linkCtx); })();
-    if (excerpt === null) excerpt = html;
-    out += `<p>${html}</p>\\n`;
-  }
-  return { html: out, toc, excerpt: excerpt ?? '' };
-}
-
-// ---------------------------------------------------------------- Templates (Parse + Partial Eval + JIT Compile)
+// ---------------------------------------------------------------- Templates (Parse + Partial Eval)
 
 const PATH_RE = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/;
 const FOR_RE = /^for ([A-Za-z_][A-Za-z0-9_]*) in (\S+)$/;
@@ -1187,13 +576,6 @@ function textOf(v) {
   return '';
 }
 
-function escTextOf(v) {
-  if (typeof v === 'string') return escapeHtml(v);
-  if (typeof v === 'number') return String(v);
-  if (typeof v === 'boolean') return v ? 'true' : 'false';
-  if (Array.isArray(v)) return escapeHtml(textOf(v));
-  return '';
-}
 function textOfJ(v) {
   if (typeof v === 'string') return jStr(v);
   if (typeof v === 'number') return String(v);
@@ -1201,6 +583,7 @@ function textOfJ(v) {
   if (Array.isArray(v)) return jStr(textOf(v));
   return '';
 }
+
 function escTextOfJ(v) {
   if (typeof v === 'string') return escapeHtmlJ(v);
   if (typeof v === 'number') return String(v);
@@ -1208,6 +591,7 @@ function escTextOfJ(v) {
   if (Array.isArray(v)) return escapeHtmlJ(textOf(v));
   return '';
 }
+
 function isPreJRaw(path) {
   const last = path[path.length - 1];
   return last === 'content' || last === 'excerpt' || last === 'html';
@@ -1316,18 +700,18 @@ function isStaticNodeList(nodes, bound, dynRoots) {
   return true;
 }
 
-function evalStaticNodes(nodes, env, out, jm) {
+function evalStaticNodes(nodes, env, out) {
   for (let i = 0; i < nodes.length; i++) {
     const n = nodes[i];
-    if (n.kind === 'text') out.push(jm ? jStr(n.text) : n.text);
-    else if (n.kind === 'var') out.push((jm ? escTextOfJ : escTextOf)(evalPath(n.path, env)));
+    if (n.kind === 'text') out.push(jStr(n.text));
+    else if (n.kind === 'var') out.push(escTextOfJ(evalPath(n.path, env)));
     else if (n.kind === 'raw') {
       const v = evalPath(n.path, env);
-      out.push(jm ? (isPreJRaw(n.path) && typeof v === 'string' ? v : textOfJ(v)) : textOf(v));
+      out.push(isPreJRaw(n.path) && typeof v === 'string' ? v : textOfJ(v));
     } else if (n.kind === 'if') {
       const cond = truthy(evalPath(n.path, env));
-      if (n.not ? !cond : cond) evalStaticNodes(n.then, env, out, jm);
-      else if (n.else !== null) evalStaticNodes(n.else, env, out, jm);
+      if (n.not ? !cond : cond) evalStaticNodes(n.then, env, out);
+      else if (n.else !== null) evalStaticNodes(n.else, env, out);
     } else if (n.kind === 'for') {
       const arr = evalPath(n.path, env);
       if (Array.isArray(arr)) {
@@ -1337,7 +721,7 @@ function evalStaticNodes(nodes, env, out, jm) {
         for (let k = 0; k < len; k++) {
           env[n.name] = arr[k];
           env.loop = { __proto__: null, index: k + 1, first: k === 0, last: k === len - 1, length: len };
-          evalStaticNodes(n.body, env, out, jm);
+          evalStaticNodes(n.body, env, out);
         }
         if (hasItem) env[n.name] = prevItem; else delete env[n.name];
         if (hasLoop) env.loop = prevLoop; else delete env.loop;
@@ -1346,7 +730,7 @@ function evalStaticNodes(nodes, env, out, jm) {
   }
 }
 
-function foldAst(nodes, staticEnv, bound, dynRoots, truthyRoots, out, jm) {
+function foldAst(nodes, staticEnv, bound, dynRoots, truthyRoots, out) {
   const pushText = (txt) => {
     if (txt === '') return;
     if (out.length > 0 && out[out.length - 1].kind === 'text') {
@@ -1358,12 +742,12 @@ function foldAst(nodes, staticEnv, bound, dynRoots, truthyRoots, out, jm) {
   for (let i = 0; i < nodes.length; i++) {
     const n = nodes[i];
     if (n.kind === 'text') {
-      pushText(jm ? jStr(n.text) : n.text);
+      pushText(jStr(n.text));
     } else if (n.kind === 'var' || n.kind === 'raw') {
       const r = n.path[0];
       if (!bound.has(r) && !dynRoots.has(r)) {
         const v = evalPath(n.path, staticEnv);
-        pushText(n.kind === 'var' ? (jm ? escTextOfJ : escTextOf)(v) : (jm ? (isPreJRaw(n.path) && typeof v === 'string' ? v : textOfJ(v)) : textOf(v)));
+        pushText(n.kind === 'var' ? escTextOfJ(v) : (isPreJRaw(n.path) && typeof v === 'string' ? v : textOfJ(v)));
       } else {
         out.push(n);
       }
@@ -1372,17 +756,17 @@ function foldAst(nodes, staticEnv, bound, dynRoots, truthyRoots, out, jm) {
       if (!bound.has(r) && !dynRoots.has(r)) {
         const cond = truthy(evalPath(n.path, staticEnv));
         const branch = (n.not ? !cond : cond) ? n.then : n.else;
-        if (branch !== null) foldAst(branch, staticEnv, bound, dynRoots, truthyRoots, out, jm);
+        if (branch !== null) foldAst(branch, staticEnv, bound, dynRoots, truthyRoots, out);
       } else if (!bound.has(r) && n.path.length === 1 && truthyRoots.has(r)) {
         const branch = n.not ? n.else : n.then;
-        if (branch !== null) foldAst(branch, staticEnv, bound, dynRoots, truthyRoots, out, jm);
+        if (branch !== null) foldAst(branch, staticEnv, bound, dynRoots, truthyRoots, out);
       } else {
         const thenOut = [];
-        foldAst(n.then, staticEnv, bound, dynRoots, truthyRoots, thenOut, jm);
+        foldAst(n.then, staticEnv, bound, dynRoots, truthyRoots, thenOut);
         let elseOut = null;
         if (n.else !== null) {
           elseOut = [];
-          foldAst(n.else, staticEnv, bound, dynRoots, truthyRoots, elseOut, jm);
+          foldAst(n.else, staticEnv, bound, dynRoots, truthyRoots, elseOut);
         }
         out.push({ kind: 'if', not: n.not, path: n.path, then: thenOut, else: elseOut });
       }
@@ -1401,7 +785,7 @@ function foldAst(nodes, staticEnv, bound, dynRoots, truthyRoots, out, jm) {
           for (let k = 0; k < len; k++) {
             staticEnv[n.name] = arr[k];
             staticEnv.loop = { __proto__: null, index: k + 1, first: k === 0, last: k === len - 1, length: len };
-            evalStaticNodes(n.body, staticEnv, buf, jm);
+            evalStaticNodes(n.body, staticEnv, buf);
           }
           if (hasItem) staticEnv[n.name] = prevItem; else delete staticEnv[n.name];
           if (hasLoop) staticEnv.loop = prevLoop; else delete staticEnv.loop;
@@ -1409,19 +793,11 @@ function foldAst(nodes, staticEnv, bound, dynRoots, truthyRoots, out, jm) {
         }
       } else {
         const bodyOut = [];
-        foldAst(n.body, staticEnv, nextBound, dynRoots, truthyRoots, bodyOut, jm);
+        foldAst(n.body, staticEnv, nextBound, dynRoots, truthyRoots, bodyOut);
         out.push({ kind: 'for', name: n.name, path: n.path, body: bodyOut });
       }
     }
   }
-}
-
-function hasControlFlow(list) {
-  for (let i = 0; i < list.length; i++) {
-    const k = list[i].kind;
-    if (k === 'if' || k === 'for') return true;
-  }
-  return false;
 }
 
 function bodyUsesBareLoop(list) {
@@ -1441,234 +817,6 @@ function bodyUsesBareLoop(list) {
 }
 
 const PROTO_KEYS = {};
-
-function compileTemplateBody(flat, extraVars, itemCaches, dynRoots, isItem, jm, safeUrls) {
-  const direct = jm && !isItem;
-  if (flat.length === 0) return direct ? () => {} : () => '';
-  if (flat.length === 1 && flat[0].kind === 'text') {
-    const s = flat[0].text;
-    return direct ? (_v, _out) => { _out.push(s); } : () => s;
-  }
-  let vid = 0;
-  const useAcc = hasControlFlow(flat);
-  const outName = direct ? '_out' : '_p';
-  const lines = (!direct && useAcc) ? ['const _p = [];'] : [];
-  const flatParts = useAcc ? null : [];
-  const scopeStack = isItem ? [{ itemName: isItem, itemVar: '_item', idxVar: null, lenVar: null, loopVar: 'undefined' }] : [];
-  const cacheRefs = [];
-  const escCache = new Map();
-  const escDecl = [];
-
-  function resolveExpr(path) {
-    const rootName = path[0];
-    if (rootName === 'loop' && path.length === 2) {
-      for (let i = scopeStack.length - 1; i >= 0; i--) {
-        const frame = scopeStack[i];
-        if (frame.idxVar !== null) {
-          const p = path[1];
-          if (p === 'index') return `(${frame.idxVar}+1)`;
-          if (p === 'first') return `(${frame.idxVar}===0)`;
-          if (p === 'last') return `(${frame.idxVar}===${frame.lenVar}-1)`;
-          if (p === 'length') return frame.lenVar;
-        }
-        break;
-      }
-    }
-    let base = null;
-    let isKnownObj = false;
-    for (let i = scopeStack.length - 1; i >= 0; i--) {
-      const frame = scopeStack[i];
-      if (rootName === 'loop') {
-        base = frame.loopVar;
-        isKnownObj = true;
-        break;
-      }
-      if (frame.itemName === rootName) {
-        base = frame.itemVar;
-        isKnownObj = true;
-        break;
-      }
-    }
-    if (base === null) {
-      if (isItem) {
-        base = `_stat.${rootName}`;
-      } else {
-        base = `vars.${rootName}`;
-        if (rootName === 'site' || (dynRoots !== null && dynRoots.has(rootName) && rootName !== 'posts')) isKnownObj = true;
-      }
-    }
-    let expr = base;
-    for (let k = 1; k < path.length; k++) {
-      const prop = path[k];
-      if (k === 1 && isKnownObj) {
-        expr = `${expr}.${prop}`;
-      } else if (k === 2 && !isItem && rootName === 'page' && (path[1] === 'newer' || path[1] === 'older') && !(prop in PROTO_KEYS)) {
-        const tmp = `_t${vid++}`;
-        expr = `((${tmp}=${expr})!==null?${tmp}.${prop}:undefined)`;
-      } else if (!(prop in PROTO_KEYS)) {
-        const tmp = `_t${vid++}`;
-        expr = `((${tmp}=${expr})!==null&&typeof ${tmp}==='object'&&!Array.isArray(${tmp})?${tmp}.${prop}:undefined)`;
-      } else {
-        const tmp = `_t${vid++}`;
-        expr = `((${tmp}=${expr})!==null&&typeof ${tmp}==='object'&&(!Array.isArray(${tmp})||_has(${tmp},${JSON.stringify(prop)}))?${tmp}.${prop}:undefined)`;
-      }
-    }
-    return expr;
-  }
-
-  function emit(list) {
-    let batch = [];
-    const flush = () => {
-      if (batch.length > 0) {
-        lines.push(`${outName}.push(${batch.join(',')});`);
-        batch = [];
-      }
-    };
-    for (let i = 0; i < list.length; i++) {
-      const n = list[i];
-      if (n.kind === 'text') {
-        const lit = JSON.stringify(n.text);
-        if (useAcc) batch.push(lit);
-        else flatParts.push(lit);
-      } else if (n.kind === 'var') {
-        const p = n.path;
-        let isSafe = false;
-        if (p.length === 2) {
-          const r = p[0], f = p[1];
-          if (r === 'loop' && (f === 'index' || f === 'length')) isSafe = true;
-          else if (!isItem && dynRoots !== null && dynRoots.has(r)) {
-            if (r === 'page' && (f === 'reading_minutes' || f === 'date' || f === 'date_long' || f === 'slug')) isSafe = true;
-            else if (r === 'h' && f === 'id') isSafe = true;
-            else if (safeUrls && (f === 'url' || f === 'newer_url' || f === 'older_url')) isSafe = true;
-            else if (r === 'pager' && (f === 'number' || f === 'total')) isSafe = true;
-            else if (r === 'tag' && (f === 'count' || f === 'slug')) isSafe = true;
-          }
-        }
-        let e;
-        if (isSafe) {
-          e = resolveExpr(p);
-        } else if (!isItem && scopeStack.length === 0 && p.length === 2 && p[0] === 'page' && p[1] === 'title') {
-          let v = escCache.get('page.title');
-          if (v === undefined) {
-            v = `_e${vid++}`;
-            escCache.set('page.title', v);
-            escDecl.push(`const ${v} = _esc(vars.page.title);`);
-          }
-          e = v;
-        } else {
-          e = `_esc(${resolveExpr(p)})`;
-        }
-        if (useAcc) batch.push(e);
-        else flatParts.push(e);
-      } else if (n.kind === 'raw') {
-        const p = n.path;
-        const isRawStr = jm ? isPreJRaw(p) : (!isItem && dynRoots !== null && dynRoots.has('page') && p.length === 2 && p[0] === 'page' && (p[1] === 'content' || p[1] === 'excerpt'));
-        const e = isRawStr ? resolveExpr(p) : `_txt(${resolveExpr(p)})`;
-        if (useAcc) batch.push(e);
-        else flatParts.push(e);
-      } else if (n.kind === 'if') {
-        flush();
-        const np = n.path;
-        let cond;
-        if (np.length === 2 && !isItem) {
-          const r = np[0], f = np[1];
-          if ((r === 'page' && (f === 'tags' || f === 'toc')) || (r === 'tag' && f === 'posts') || (r === 'p' && f === 'tags')) cond = `(${resolveExpr(np)}.length>0)`;
-          else if ((r === 'page' && (f === 'date' || f === 'summary')) || (r === 'pager' && (f === 'newer_url' || f === 'older_url')) || (r === 't' && f === 'url') || (r === 'p' && f === 'summary')) cond = `(${resolveExpr(np)}!=="")`;
-          else if (r === 'page' && (f === 'newer' || f === 'older')) cond = `(${resolveExpr(np)}!==null)`;
-          else cond = `_tru(${resolveExpr(np)})`;
-        } else {
-          cond = `_tru(${resolveExpr(np)})`;
-        }
-        lines.push(`if (${n.not ? '!' + cond : cond}) {`);
-        emit(n.then);
-        if (n.else !== null && n.else.length > 0) {
-          lines.push('} else {');
-          emit(n.else);
-        }
-        lines.push('}');
-      } else if (n.kind === 'for') {
-        flush();
-        const arrVar = `_a${vid++}`;
-        const lenVar = `_n${vid++}`;
-        const idxVar = `_k${vid++}`;
-        const itemVar = `_x${vid++}`;
-        const onlyItem = (n.path.length !== 2 || n.path[1] !== 'toc') && !isItem && scopeStack.length === 0 && !bodyUsesLoop(n.body) && (() => {
-          const b = new Set([n.name]);
-          return isStaticNodeList(n.body, b, dynRoots);
-        })();
-        if (onlyItem) {
-          const key = n.name + ':' + JSON.stringify(n.body);
-          let entry = itemCaches.get(key);
-          if (entry === undefined) {
-            const subFn = compileTemplateBody(n.body, extraVars, null, null, n.name, jm, safeUrls);
-            entry = { cache: new Map(), fn: subFn };
-            itemCaches.set(key, entry);
-          }
-          const cid = cacheRefs.length;
-          cacheRefs.push(entry);
-          lines.push(`const ${arrVar} = ${resolveExpr(n.path)};`);
-          lines.push(`if (Array.isArray(${arrVar})) {`);
-          lines.push(`const ${lenVar} = ${arrVar}.length;`);
-          lines.push(`const _c${cid} = _caches[${cid}].cache, _f${cid} = _caches[${cid}].fn;`);
-          lines.push(`for (let ${idxVar} = 0; ${idxVar} < ${lenVar}; ${idxVar}++) {`);
-          lines.push(`const ${itemVar} = ${arrVar}[${idxVar}];`);
-          lines.push(`let _r${cid} = _c${cid}.get(${itemVar});`);
-          lines.push(`if (_r${cid} === undefined) { _r${cid} = _f${cid}(${itemVar}); _c${cid}.set(${itemVar}, _r${cid}); }`);
-          lines.push(`${outName}.push(_r${cid});`);
-          lines.push('}');
-          lines.push('}');
-        } else {
-          const needBareLoop = bodyUsesBareLoop(n.body);
-          const loopVar = needBareLoop ? `_l${vid++}` : 'undefined';
-          lines.push(`const ${arrVar} = ${resolveExpr(n.path)};`);
-          lines.push(`if (Array.isArray(${arrVar})) {`);
-          lines.push(`const ${lenVar} = ${arrVar}.length;`);
-          lines.push(`for (let ${idxVar} = 0; ${idxVar} < ${lenVar}; ${idxVar}++) {`);
-          lines.push(`const ${itemVar} = ${arrVar}[${idxVar}];`);
-          if (needBareLoop) {
-            lines.push(`const ${loopVar} = { index: ${idxVar} + 1, first: ${idxVar} === 0, last: ${idxVar} === ${lenVar} - 1, length: ${lenVar} };`);
-          }
-          scopeStack.push({ itemName: n.name, itemVar, idxVar, lenVar, loopVar });
-          emit(n.body);
-          scopeStack.pop();
-          lines.push('}');
-          lines.push('}');
-        }
-      }
-    }
-    if (useAcc) flush();
-  }
-
-  emit(flat);
-  if (escDecl.length > 0) lines.unshift(...escDecl);
-  if (direct) {
-    if (!useAcc && flatParts.length > 0) {
-      lines.push(`_out.push(${flatParts.join(',')});`);
-    }
-    const factory = new Function('_esc', '_txt', '_tru', '_has', '_caches', `return function(vars, _out) {\n${lines.join('\n')}\n};`);
-    return factory(escTextOfJ, textOfJ, truthy, Object.hasOwn, cacheRefs);
-  }
-  if (useAcc) {
-    lines.push('return _p.length === 1 ? _p[0] : _p.join("");');
-  } else if (flatParts.length === 0) {
-    lines.push('return "";');
-  } else if (flatParts.length === 1) {
-    lines.push(`return ${flatParts[0]};`);
-  } else {
-    lines.push(`return [${flatParts.join(',')}].join("");`);
-  }
-  const fnEsc = jm ? escTextOfJ : escTextOf, fnTxt = jm ? textOfJ : textOf;
-  if (isItem) {
-    const factory = new Function('_stat', '_esc', '_txt', '_tru', '_has', `return function(_item) {\n${lines.join('\n')}\n};`);
-    return factory(extraVars, fnEsc, fnTxt, truthy, Object.hasOwn);
-  }
-  const factory = new Function('_esc', '_txt', '_tru', '_has', '_caches', `return function(vars) {\n${lines.join('\n')}\n};`);
-  return factory(fnEsc, fnTxt, truthy, Object.hasOwn, cacheRefs);
-}
-
-function compileBodyToFn(flat, extraVars, itemCaches, dynRoots, jm, safeUrls) {
-  return compileTemplateBody(flat, extraVars, itemCaches, dynRoots, null, jm, safeUrls);
-}
 
 // ---------------------------------------------------------------- Path helpers
 
@@ -1708,7 +856,7 @@ function resolveLinkCtx(ctx, target) {
   if (c0 === 47 || c0 === 35 || (target.includes(':') && SCHEME_RE.test(target))) {
     let esc = ctx.extMap.get(target);
     if (esc === undefined) {
-      esc = ctx.jm ? escapeHtmlJ(target) : escapeHtml(target);
+      esc = escapeHtmlJ(target);
       ctx.extMap.set(target, esc);
     }
     ctx.urlMap.set(target, esc);
@@ -1734,418 +882,19 @@ function resolveLinkCtx(ctx, target) {
     const targetSrc = ctx.bySource.get(path);
     if (targetSrc !== undefined) {
       const rawUrl = frag === '' ? targetSrc.url : `${targetSrc.url}${frag}`;
-      const esc = (ctx.safeUrls && (frag === '' || !ESCJ_TEST.test(frag))) ? rawUrl : (ctx.jm ? escapeHtmlJ : escapeHtml)(rawUrl);
+      const esc = (ctx.safeUrls && (frag === '' || !ESCJ_TEST.test(frag))) ? rawUrl : escapeHtmlJ(rawUrl);
       ctx.urlMap.set(target, esc);
       return esc;
     }
     if (ctx.staticPaths.has(path)) {
       const rawUrl = frag === '' ? `${ctx.base}/${path}` : `${ctx.base}/${path}${frag}`;
-      const esc = (ctx.safeUrls && !ESCJ_TEST.test(path) && (frag === '' || !ESCJ_TEST.test(frag))) ? rawUrl : (ctx.jm ? escapeHtmlJ : escapeHtml)(rawUrl);
+      const esc = (ctx.safeUrls && !ESCJ_TEST.test(path) && (frag === '' || !ESCJ_TEST.test(frag))) ? rawUrl : escapeHtmlJ(rawUrl);
       ctx.urlMap.set(target, esc);
       return esc;
     }
   }
   ctx.broken.add(`broken-link ${ctx.srcPath} -> ${target}`);
-  return (ctx.jm ? escapeHtmlJ : escapeHtml)(target);
-}
-
-// ---------------------------------------------------------------- Main entry
-
-function runCore(input, jm) {
-  const slugCache = new Map();
-  const slugify = (text) => {
-    let s = slugCache.get(text);
-    if (s === undefined) {
-      s = slugifyRaw(text);
-      slugCache.set(text, s);
-    }
-    return s;
-  };
-
-  const templates = new Map();
-  const report = [];
-  const tplNames = Object.keys(input.templates).sort(byCodeUnits);
-  for (let i = 0; i < tplNames.length; i++) {
-    const name = tplNames[i];
-    try {
-      templates.set(name, parseTemplate(name, input.templates[name]));
-    } catch (err) {
-      if (!(err instanceof TemplateError)) throw err;
-      report.push(err.message);
-    }
-  }
-
-  const base = input.site.base_url.replace(/\/+$/, '');
-  let safeUrls = !ESCJ_TEST.test(base);
-  const files = [...input.files].sort((x, y) => byCodeUnits(x.path, y.path));
-
-  const sources = [];
-  const statics = [];
-  for (let i = 0; i < files.length; i++) {
-    const f = files[i];
-    if (f.path.endsWith('.md')) {
-      const content = f.content.includes('\r') ? f.content.replace(/\r\n?/g, '\n') : f.content;
-      sources.push({ path: f.path, text: content });
-    } else {
-      statics.push({ path: f.path, content: f.content });
-    }
-  }
-
-  // 2. Front matter
-  const kept = [];
-  for (let i = 0; i < sources.length; i++) {
-    const s = sources[i];
-    const fm = parseFrontMatter(s.text);
-    if ('error' in fm) {
-      report.push(`refused ${s.path}: ${fm.error}`);
-      continue;
-    }
-    s.data = fm.data;
-    s.body = fm.body;
-    const post = s.path.startsWith('posts/');
-    s.post = post;
-    if (!post) {
-      if (s.path.startsWith('tags/')) {
-        report.push(`refused ${s.path}: tags/ is the generator's own`);
-        continue;
-      }
-      if (s.path.startsWith('page/')) {
-        report.push(`refused ${s.path}: page/ is the generator's own`);
-        continue;
-      }
-    }
-    if (post && s.data.date === undefined) {
-      report.push(`refused ${s.path}: a post needs a date`);
-      continue;
-    }
-    const layout = s.data.layout ?? (post ? 'post' : 'page');
-    if (!templates.has(layout)) {
-      report.push(`refused ${s.path}: layout "${layout}" is no template that parses`);
-      continue;
-    }
-    s.layout = layout;
-    if (s.data.draft === true) {
-      report.push(`draft ${s.path}`);
-      continue;
-    }
-    kept.push(s);
-  }
-
-  // 3. Permalinks
-  const taken = new Map();
-  const bySource = new Map();
-  for (let i = 0; i < kept.length; i++) {
-    const s = kept[i];
-    const dir = s.post ? 'posts' : dirOf(s.path);
-    let set = taken.get(dir);
-    if (safeUrls && dir !== '' && ESCJ_TEST.test(dir)) safeUrls = false;
-    if (set === undefined) {
-      set = new Set(dir === '' ? RESERVED : undefined);
-      taken.set(dir, set);
-    }
-    const slug = uniqueSlug(s.data.slug ?? slugify(s.data.title), set);
-    s.slug = slug;
-    s.outDir = dir === '' ? slug : `${dir}/${slug}`;
-    s.url = `${base}/${s.outDir}/`;
-    bySource.set(s.path, s);
-  }
-
-  // 4. Markdown
-  const staticPaths = new Set();
-  for (let i = 0; i < statics.length; i++) staticPaths.add(statics[i].path);
-  const broken = new Set();
-  const dirPartsCache = new Map();
-  const urlCaches = new Map();
-  const emptyParts = [];
-  const linkCtx = { srcPath: '', dir: '', dirParts: emptyParts, bySource, staticPaths, base, broken, relCache: new Map(), urlMap: null, extMap: new Map(), safeUrls, jm };
-  for (let i = 0; i < kept.length; i++) {
-    const s = kept[i];
-    const dir = dirOf(s.path);
-    let dirParts = dir === '' ? emptyParts : dirPartsCache.get(dir);
-    if (dirParts === undefined) {
-      dirParts = dir.split('/');
-      dirPartsCache.set(dir, dirParts);
-    }
-    let urlMap = urlCaches.get(dir);
-    if (urlMap === undefined) {
-      urlMap = new Map();
-      urlCaches.set(dir, urlMap);
-    }
-    linkCtx.srcPath = s.path;
-    linkCtx.dir = dir;
-    linkCtx.dirParts = dirParts;
-    linkCtx.urlMap = urlMap;
-    const md = (jm ? renderMarkdownJ : renderMarkdown)(s.body, resolveLinkCtx, linkCtx, slugify);
-    s.html = md.html;
-    s.toc = md.toc;
-    s.excerpt = md.excerpt;
-  }
-
-  // 5. Collections
-  const posts = [];
-  for (let i = 0; i < kept.length; i++) {
-    if (kept[i].post) posts.push(kept[i]);
-  }
-  posts.sort((x, y) => byCodeUnits(y.data.date, x.data.date) || byCodeUnits(x.slug, y.slug));
-  for (let k = 0; k < posts.length; k++) {
-    posts[k].newer = k === 0 ? null : posts[k - 1];
-    posts[k].older = k === posts.length - 1 ? null : posts[k + 1];
-  }
-
-  // 6. Tags
-  const bySlug = new Map();
-  for (let i = 0; i < posts.length; i++) {
-    const p = posts[i];
-    const rawTags = p.data.tags;
-    if (rawTags === undefined || rawTags.length === 0) {
-      p.tagRefs = [];
-      continue;
-    }
-    const refs = [];
-    const seen = new Set();
-    for (let j = 0; j < rawTags.length; j++) {
-      const name = rawTags[j];
-      const slug = slugify(name);
-      if (seen.has(slug)) continue;
-      seen.add(slug);
-      let tag = bySlug.get(slug);
-      if (tag === undefined) {
-        const url = `${base}/tags/${slug}/`;
-        tag = { name, slug, url, posts: [], pub: { name, slug, url } };
-        bySlug.set(slug, tag);
-      }
-      tag.posts.push(p);
-      refs.push(tag.pub);
-    }
-    p.tagRefs = refs;
-  }
-  for (let i = 0; i < kept.length; i++) {
-    const s = kept[i];
-    if (!s.post) {
-      const rawTags = s.data.tags;
-      if (rawTags === undefined || rawTags.length === 0) {
-        s.tagRefs = [];
-        continue;
-      }
-      const refs = [];
-      const seen = new Set();
-      for (let j = 0; j < rawTags.length; j++) {
-        const name = rawTags[j];
-        const slug = slugify(name);
-        if (seen.has(slug)) continue;
-        seen.add(slug);
-        const existing = bySlug.get(slug);
-        refs.push(existing !== undefined ? existing.pub : { name, slug, url: '' });
-      }
-      s.tagRefs = refs;
-    }
-  }
-  const tagsList = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.slug, y.slug));
-
-  // 7. Layouts
-  const dateCache = new Map();
-  const cachedLongDate = (d) => {
-    let ld = dateCache.get(d);
-    if (ld === undefined) {
-      ld = longDate(d);
-      dateCache.set(d, ld);
-    }
-    return ld;
-  };
-  const linkOf = (s) => {
-    if (s === null) return null;
-    if (s.link !== undefined) return s.link;
-    const dl = s.data.date === undefined ? '' : cachedLongDate(s.data.date);
-    s.dateLong = dl;
-    s.link = {
-      title: s.data.title,
-      url: s.url,
-      date: s.data.date ?? '',
-      date_long: dl,
-    };
-    return s.link;
-  };
-
-  for (let i = 0; i < posts.length; i++) {
-    const p = posts[i];
-    const dl = p.data.date === undefined ? '' : cachedLongDate(p.data.date);
-    p.dateLong = dl;
-    p.card = {
-      title: p.data.title,
-      url: p.url,
-      date: p.data.date ?? '',
-      date_long: dl,
-      summary: p.data.summary ?? '',
-      excerpt: p.excerpt,
-      reading_minutes: Math.max(1, Math.ceil(wordsOf(p.body) / 200)),
-      tags: p.tagRefs,
-    };
-  }
-
-  const site = { title: input.site.title, base_url: base };
-  const allTags = tagsList.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
-  const recentCount = Math.min(input.site.recent, posts.length);
-  const recent = new Array(recentCount);
-  for (let i = 0; i < recentCount; i++) recent[i] = posts[i].card;
-
-  const staticEnv = { site, tags: allTags, recent };
-  const DYN_BY_KIND = {
-    page: new Set(['page']),
-    index: new Set(['posts', 'pager']),
-    tag: new Set(['tag']),
-    tags: new Set(),
-  };
-  const TRUTHY_BY_KIND = {
-    page: new Set(['page']),
-    index: new Set(['pager']),
-    tag: new Set(['tag']),
-    tags: new Set(),
-  };
-  const emptyBound = new Set();
-  const itemCaches = new Map();
-  const compiled = new Map();
-  const getRenderer = (kind, name) => {
-    const key = `${kind}:${name}`;
-    let r = compiled.get(key);
-    if (r === undefined) {
-      const nodes = templates.get(name);
-      if (nodes === undefined) return null;
-      const inlined = [];
-      inlineAst(nodes, 0, templates, inlined);
-      const folded = [];
-      const dyn = DYN_BY_KIND[kind];
-      const tru = TRUTHY_BY_KIND[kind];
-      foldAst(inlined, staticEnv, emptyBound, dyn, tru, folded, jm);
-      const fn = compileBodyToFn(folded, staticEnv, itemCaches, dyn, jm, safeUrls);
-      r = { fn, needsRm: astUsesProp(folded, 'reading_minutes') };
-      compiled.set(key, r);
-    }
-    return r;
-  };
-
-  const output = jm ? null : {};
-  const outKeys = jm ? new Set() : null;
-  const pairs = jm ? ['{'] : null;
-  let sep = '"';
-  const emitRendered = jm
-    ? (k, fn, vars) => { outKeys.add(k); pairs.push(sep + jStr(k) + '":"'); sep = '","'; fn(vars, pairs); }
-    : (k, fn, vars) => { output[k] = fn(vars); };
-  const emitStatic = jm
-    ? (k, v) => { outKeys.add(k); pairs.push(sep + jStr(k) + '":"' + v); sep = '","'; }
-    : (k, v) => { output[k] = v; };
-  const pageObj = {
-    title: '',
-    url: '',
-    date: '',
-    date_long: '',
-    summary: '',
-    excerpt: '',
-    reading_minutes: 0,
-    tags: null,
-    slug: '',
-    content: '',
-    toc: null,
-    newer: null,
-    older: null,
-    is_post: false,
-  };
-  const pageVars = { site, tags: allTags, recent, page: pageObj };
-  for (let i = 0; i < kept.length; i++) {
-    const s = kept[i];
-    const rObj = getRenderer('page', s.layout);
-    const renderer = rObj.fn;
-    const needsRm = rObj.needsRm;
-    if (s.post) {
-      const card = s.card;
-      pageObj.title = card.title;
-      pageObj.url = card.url;
-      pageObj.date = card.date;
-      pageObj.date_long = card.date_long;
-      pageObj.summary = card.summary;
-      pageObj.excerpt = card.excerpt;
-      pageObj.reading_minutes = card.reading_minutes;
-      pageObj.tags = card.tags;
-      pageObj.slug = s.slug;
-      pageObj.content = s.html;
-      pageObj.toc = s.toc;
-      pageObj.newer = linkOf(s.newer ?? null);
-      pageObj.older = linkOf(s.older ?? null);
-      pageObj.is_post = true;
-    } else {
-      pageObj.title = s.data.title;
-      pageObj.url = s.url;
-      pageObj.date = s.data.date ?? '';
-      pageObj.date_long = s.data.date === undefined ? '' : cachedLongDate(s.data.date);
-      pageObj.summary = s.data.summary ?? '';
-      pageObj.excerpt = s.excerpt;
-      pageObj.reading_minutes = needsRm ? Math.max(1, Math.ceil(wordsOf(s.body) / 200)) : 0;
-      pageObj.tags = s.tagRefs;
-      pageObj.slug = s.slug;
-      pageObj.content = s.html;
-      pageObj.toc = s.toc;
-      pageObj.newer = null;
-      pageObj.older = null;
-      pageObj.is_post = false;
-    }
-    emitRendered(`${s.outDir}/index.html`, renderer, pageVars);
-  }
-
-  const indexRenderer = getRenderer('index', 'index')?.fn ?? null;
-  if (indexRenderer !== null) {
-    const per = input.site.per_page;
-    const pages = Math.max(1, Math.ceil(posts.length / per));
-    const indexUrl = (k) => (k === 1 ? `${base}/` : `${base}/page/${k}/`);
-    const pagerObj = { number: 0, total: pages, url: '', newer_url: '', older_url: '' };
-    const indexVars = { site, tags: allTags, recent, posts: null, pager: pagerObj };
-    for (let k = 1; k <= pages; k++) {
-      const start = (k - 1) * per;
-      const end = Math.min(k * per, posts.length);
-      const pagePosts = new Array(Math.max(0, end - start));
-      for (let i = start; i < end; i++) pagePosts[i - start] = posts[i].card;
-      pagerObj.number = k;
-      pagerObj.url = indexUrl(k);
-      pagerObj.newer_url = k === 1 ? '' : indexUrl(k - 1);
-      pagerObj.older_url = k === pages ? '' : indexUrl(k + 1);
-      indexVars.posts = pagePosts;
-      emitRendered(k === 1 ? 'index.html' : `page/${k}/index.html`, indexRenderer, indexVars);
-    }
-  }
-
-  const tagRenderer = getRenderer('tag', 'tag')?.fn ?? null;
-  if (tagRenderer !== null) {
-    const tagObj = { name: '', slug: '', url: '', count: 0, posts: null };
-    const tagVars = { site, tags: allTags, recent, tag: tagObj };
-    for (let i = 0; i < tagsList.length; i++) {
-      const t = tagsList[i];
-      const tPosts = new Array(t.posts.length);
-      for (let j = 0; j < t.posts.length; j++) tPosts[j] = t.posts[j].card;
-      tagObj.name = t.name;
-      tagObj.slug = t.slug;
-      tagObj.url = t.url;
-      tagObj.count = t.posts.length;
-      tagObj.posts = tPosts;
-      emitRendered(`tags/${t.slug}/index.html`, tagRenderer, tagVars);
-    }
-  }
-
-  const tagsRenderer = getRenderer('tags', 'tags')?.fn ?? null;
-  if (tagsRenderer !== null) {
-    emitRendered('tags/index.html', tagsRenderer, { site, tags: allTags, recent });
-  }
-
-  for (let i = 0; i < statics.length; i++) {
-    const f = statics[i];
-    if (jm ? outKeys.has(f.path) : Object.hasOwn(output, f.path)) report.push(`shadowed ${f.path}: a built page has its path`);
-    else emitStatic(f.path, jm ? jStr(f.content) : f.content);
-  }
-
-  // 8. Report
-  const lines = [...report, ...broken].sort(byCodeUnits);
-  const pagesCount = kept.length - posts.length;
-  lines.push(`built ${pagesCount} pages, ${posts.length} posts, ${tagsList.length} tags and ${statics.length} static files`);
-  emitStatic(REPORT_FILE, jm ? jStr(`${lines.join('\n')}\n`) : `${lines.join('\n')}\n`);
-  if (jm) { pairs.push(sep === '"' ? '}' : '"}'); return pairs.join(''); }
-  return output;
+  return escapeHtmlJ(target);
 }
 
 // ---------------------------------------------------------------- Zero-Alloc OutSlab Engine
@@ -2159,13 +908,9 @@ function growSlab(slab, extra) {
   const need = slab.pos + extra;
   while (newCap < need) newCap *= 2;
   const next = Buffer.allocUnsafe(newCap);
-  slab.buf.copy(next, 0, 0, slab.pos);
+  next.set(slab.buf.subarray(0, slab.pos), 0);
   slab.buf = next;
   slab.cap = newCap;
-}
-
-function ensureSlab(slab, extra) {
-  if (slab.pos + extra > slab.cap) growSlab(slab, extra);
 }
 
 function writeSlabBuf(slab, src) {
@@ -2174,10 +919,10 @@ function writeSlabBuf(slab, src) {
   if (slab.pos + len > slab.cap) growSlab(slab, len);
   const dst = slab.buf;
   let p = slab.pos;
-  if (len <= 32) {
+  if (len <= 16) {
     for (let i = 0; i < len; i++) dst[p++] = src[i];
   } else {
-    src.copy(dst, p);
+    dst.set(src, p);
     p += len;
   }
   slab.pos = p;
@@ -2187,8 +932,15 @@ function writeSlabSlice(slab, src, start, end) {
   const len = end - start;
   if (len <= 0) return;
   if (slab.pos + len > slab.cap) growSlab(slab, len);
-  src.copy(slab.buf, slab.pos, start, end);
-  slab.pos += len;
+  if (len <= 16) {
+    const dst = slab.buf;
+    let p = slab.pos;
+    for (let i = start; i < end; i++) dst[p++] = src[i];
+    slab.pos = p;
+  } else {
+    src.copy(slab.buf, slab.pos, start, end);
+    slab.pos += len;
+  }
 }
 
 function writeRawStr(s, slab) {
@@ -2258,83 +1010,7 @@ function writeAsciiOrVal(v, slab) {
   }
 }
 
-const J_ESC_TBL = new Uint8Array(128);
-for (let i = 0; i < 32; i++) J_ESC_TBL[i] = 1;
-J_ESC_TBL[34] = 1;
-J_ESC_TBL[92] = 1;
-
-// Tiny zero-deopt leaf scanner for inline markdown: copies plain ASCII AND escapes & < > " ' \n,
-// stopping only on markdown syntax (* ` [ \), control chars <32 (other than \n), or non-ASCII >=128.
-const INLINE_STOP_TBL = new Uint8Array(128);
-for (let i = 0; i < 32; i++) INLINE_STOP_TBL[i] = 1;
-INLINE_STOP_TBL[10] = 0; // handled inline
-INLINE_STOP_TBL[42] = 1; // *
-INLINE_STOP_TBL[91] = 1; // [
-INLINE_STOP_TBL[92] = 1; // \
-INLINE_STOP_TBL[96] = 1; // `
-
-function scanInlineFast(s, i, end, slab) {
-  const dst = slab.buf;
-  let p = slab.pos;
-  while (i < end) {
-    const c = s.charCodeAt(i);
-    if (c >= 128) break;
-    if (INLINE_J_TBL[c] === 0) {
-      dst[p++] = c;
-      i++;
-      continue;
-    }
-    if (c === 10) { dst[p++] = 92; dst[p++] = 110; i++; continue; }
-    if (c === 39) { dst[p++]=38; dst[p++]=35; dst[p++]=51; dst[p++]=57; dst[p++]=59; i++; continue; }
-    if (c === 34) { dst[p++]=38; dst[p++]=113; dst[p++]=117; dst[p++]=111; dst[p++]=116; dst[p++]=59; i++; continue; }
-    if (c === 38) { dst[p++]=38; dst[p++]=97; dst[p++]=109; dst[p++]=112; dst[p++]=59; i++; continue; }
-    if (c === 60) { dst[p++]=38; dst[p++]=108; dst[p++]=116; dst[p++]=59; i++; continue; }
-    if (c === 62) { dst[p++]=38; dst[p++]=103; dst[p++]=116; dst[p++]=59; i++; continue; }
-    break;
-  }
-  slab.pos = p;
-  return i;
-}
-
-function scanPlainToSlab(s, i, end, slab, tbl) {
-  const dst = slab.buf;
-  let p = slab.pos;
-  while (i < end) {
-    const c = s.charCodeAt(i);
-    if (c >= 128 || tbl[c] !== 0) break;
-    dst[p++] = c;
-    i++;
-  }
-  slab.pos = p;
-  return i;
-}
-
-function writeUtf8Char(s, i, end, slab) {
-  const c = s.charCodeAt(i);
-  const dst = slab.buf;
-  let p = slab.pos;
-  if (c < 0x800) {
-    dst[p++] = 0xc0 | (c >> 6);
-    dst[p++] = 0x80 | (c & 0x3f);
-  } else if (c >= 0xd800 && c <= 0xdbff && i + 1 < end) {
-    const c2 = s.charCodeAt(++i);
-    const cp = 0x10000 + (((c & 0x3ff) << 10) | (c2 & 0x3ff));
-    dst[p++] = 0xf0 | (cp >> 18);
-    dst[p++] = 0x80 | ((cp >> 12) & 0x3f);
-    dst[p++] = 0x80 | ((cp >> 6) & 0x3f);
-    dst[p++] = 0x80 | (cp & 0x3f);
-  } else {
-    dst[p++] = 0xe0 | (c >> 12);
-    dst[p++] = 0x80 | ((c >> 6) & 0x3f);
-    dst[p++] = 0x80 | (c & 0x3f);
-  }
-  slab.pos = p;
-  return i + 1;
-}
-
-function writeJCtrlChar(c, slab) {
-  const dst = slab.buf;
-  let p = slab.pos;
+function writeJCtrlChar(c, dst, p) {
   if (c === 34) { dst[p++] = 92; dst[p++] = 34; }
   else if (c === 92) { dst[p++] = 92; dst[p++] = 92; }
   else if (c === 10) { dst[p++] = 92; dst[p++] = 110; }
@@ -2348,58 +1024,76 @@ function writeJCtrlChar(c, slab) {
     const d = c & 15;
     dst[p++] = d < 10 ? 48 + d : 87 + d;
   }
-  slab.pos = p;
-}
-
-function writeHtmlJChar(c, slab) {
-  const dst = slab.buf;
-  let p = slab.pos;
-  if (c === 38) { dst[p++]=38; dst[p++]=97; dst[p++]=109; dst[p++]=112; dst[p++]=59; }
-  else if (c === 60) { dst[p++]=38; dst[p++]=108; dst[p++]=116; dst[p++]=59; }
-  else if (c === 62) { dst[p++]=38; dst[p++]=103; dst[p++]=116; dst[p++]=59; }
-  else if (c === 34) { dst[p++]=38; dst[p++]=113; dst[p++]=117; dst[p++]=111; dst[p++]=116; dst[p++]=59; }
-  else if (c === 39) { dst[p++]=38; dst[p++]=35; dst[p++]=51; dst[p++]=57; dst[p++]=59; }
-  else {
-    writeJCtrlChar(c, slab);
-    return;
-  }
-  slab.pos = p;
+  return p;
 }
 
 function writeJStrSlab(s, start, end, slab) {
   const len = end - start;
   if (len <= 0) return;
   if (slab.pos + len * 6 > slab.cap) growSlab(slab, len * 6);
-  let i = start;
-  while (i < end) {
-    i = scanPlainToSlab(s, i, end, slab, J_ESC_TBL);
-    if (i >= end) break;
+  const dst = slab.buf;
+  let p = slab.pos;
+  for (let i = start; i < end; i++) {
     const c = s.charCodeAt(i);
     if (c < 128) {
-      writeJCtrlChar(c, slab);
-      i++;
+      if (J_ESC_TBL[c] === 0) {
+        dst[p++] = c;
+      } else {
+        p = writeJCtrlChar(c, dst, p);
+      }
+    } else if (c < 0x800) {
+      dst[p++] = 0xc0 | (c >> 6);
+      dst[p++] = 0x80 | (c & 0x3f);
+    } else if (c >= 0xd800 && c <= 0xdbff && i + 1 < end) {
+      const c2 = s.charCodeAt(++i);
+      const cp = 0x10000 + (((c & 0x3ff) << 10) | (c2 & 0x3ff));
+      dst[p++] = 0xf0 | (cp >> 18);
+      dst[p++] = 0x80 | ((cp >> 12) & 0x3f);
+      dst[p++] = 0x80 | ((cp >> 6) & 0x3f);
+      dst[p++] = 0x80 | (cp & 0x3f);
     } else {
-      i = writeUtf8Char(s, i, end, slab);
+      dst[p++] = 0xe0 | (c >> 12);
+      dst[p++] = 0x80 | ((c >> 6) & 0x3f);
+      dst[p++] = 0x80 | (c & 0x3f);
     }
   }
+  slab.pos = p;
 }
 
 function writeHtmlJSlab(s, start, end, slab) {
   const len = end - start;
   if (len <= 0) return;
   if (slab.pos + len * 6 > slab.cap) growSlab(slab, len * 6);
-  let i = start;
-  while (i < end) {
-    i = scanPlainToSlab(s, i, end, slab, ESC_J_TBL);
-    if (i >= end) break;
+  const dst = slab.buf;
+  let p = slab.pos;
+  for (let i = start; i < end; i++) {
     const c = s.charCodeAt(i);
     if (c < 128) {
-      writeHtmlJChar(c, slab);
-      i++;
+      if (ESC_J_TBL[c] === 0) {
+        dst[p++] = c;
+      } else if (c === 38) { dst[p++]=38; dst[p++]=97; dst[p++]=109; dst[p++]=112; dst[p++]=59; }
+      else if (c === 60) { dst[p++]=38; dst[p++]=108; dst[p++]=116; dst[p++]=59; }
+      else if (c === 62) { dst[p++]=38; dst[p++]=103; dst[p++]=116; dst[p++]=59; }
+      else if (c === 34) { dst[p++]=38; dst[p++]=113; dst[p++]=117; dst[p++]=111; dst[p++]=116; dst[p++]=59; }
+      else if (c === 39) { dst[p++]=38; dst[p++]=35; dst[p++]=51; dst[p++]=57; dst[p++]=59; }
+      else p = writeJCtrlChar(c, dst, p);
+    } else if (c < 0x800) {
+      dst[p++] = 0xc0 | (c >> 6);
+      dst[p++] = 0x80 | (c & 0x3f);
+    } else if (c >= 0xd800 && c <= 0xdbff && i + 1 < end) {
+      const c2 = s.charCodeAt(++i);
+      const cp = 0x10000 + (((c & 0x3ff) << 10) | (c2 & 0x3ff));
+      dst[p++] = 0xf0 | (cp >> 18);
+      dst[p++] = 0x80 | ((cp >> 12) & 0x3f);
+      dst[p++] = 0x80 | ((cp >> 6) & 0x3f);
+      dst[p++] = 0x80 | (cp & 0x3f);
     } else {
-      i = writeUtf8Char(s, i, end, slab);
+      dst[p++] = 0xe0 | (c >> 12);
+      dst[p++] = 0x80 | ((c >> 6) & 0x3f);
+      dst[p++] = 0x80 | (c & 0x3f);
     }
   }
+  slab.pos = p;
 }
 
 function writeEscTextValSlab(v, slab) {
@@ -2430,31 +1124,13 @@ function writeRawTextValSlab(v, slab) {
 
 const B_TRUE = Buffer.from('true');
 const B_FALSE = Buffer.from('false');
-const B_P_OPEN = Buffer.from('<p>');
-const B_P_CLOSE = Buffer.from('</p>\\n');
-const B_LI_OPEN = Buffer.from('<li>');
-const B_LI_CLOSE = Buffer.from('</li>\\n');
-const B_UL_OPEN = Buffer.from('<ul>\\n');
-const B_UL_CLOSE = Buffer.from('</ul>\\n');
-const B_OL_OPEN = Buffer.from('<ol>\\n');
-const B_OL_CLOSE = Buffer.from('</ol>\\n');
 const B_PRE_OPEN = Buffer.from('<pre><code>');
 const B_PRE_LANG = Buffer.from('<pre><code class=\\"language-');
 const B_PRE_LANG_END = Buffer.from('\\">');
 const B_PRE_CLOSE = Buffer.from('</code></pre>\\n');
-const B_HR = Buffer.from('<hr>\\n');
 const B_BQ_EMPTY = Buffer.from('<blockquote>\\n</blockquote>\\n');
 const B_BQ_OPEN = Buffer.from('<blockquote>\\n<p>');
 const B_BQ_CLOSE = Buffer.from('</p>\\n</blockquote>\\n');
-const B_STRONG_OPEN = Buffer.from('<strong>');
-const B_STRONG_CLOSE = Buffer.from('</strong>');
-const B_EM_OPEN = Buffer.from('<em>');
-const B_EM_CLOSE = Buffer.from('</em>');
-const B_CODE_OPEN = Buffer.from('<code>');
-const B_CODE_CLOSE = Buffer.from('</code>');
-const B_A_OPEN = Buffer.from('<a href=\\"');
-const B_A_MID = Buffer.from('\\">');
-const B_A_CLOSE = Buffer.from('</a>');
 
 function resolveLinkATagBuf(ctx, target) {
   let buf = ctx.aBufMap.get(target);
@@ -2465,10 +1141,56 @@ function resolveLinkATagBuf(ctx, target) {
   return buf;
 }
 
+function writeUtf8Char(s, i, end, slab) {
+  const c = s.charCodeAt(i);
+  const dst = slab.buf;
+  let p = slab.pos;
+  if (c < 0x800) {
+    dst[p++] = 0xc0 | (c >> 6);
+    dst[p++] = 0x80 | (c & 0x3f);
+  } else if (c >= 0xd800 && c <= 0xdbff && i + 1 < end) {
+    const c2 = s.charCodeAt(++i);
+    const cp = 0x10000 + (((c & 0x3ff) << 10) | (c2 & 0x3ff));
+    dst[p++] = 0xf0 | (cp >> 18);
+    dst[p++] = 0x80 | ((cp >> 12) & 0x3f);
+    dst[p++] = 0x80 | ((cp >> 6) & 0x3f);
+    dst[p++] = 0x80 | (cp & 0x3f);
+  } else {
+    dst[p++] = 0xe0 | (c >> 12);
+    dst[p++] = 0x80 | ((c >> 6) & 0x3f);
+    dst[p++] = 0x80 | (c & 0x3f);
+  }
+  slab.pos = p;
+  return i + 1;
+}
+
+// Tiny zero-deopt leaf scanner for ASCII inline markdown + escaping;
+// stops on markdown syntax (* ` [ \), control chars < 32 (other than \n), or non-ASCII >= 128.
+function scanInlineFast(s, i, end, slab) {
+  const dst = slab.buf;
+  let p = slab.pos;
+  while (i < end) {
+    const c = s.charCodeAt(i);
+    if (c >= 128) break;
+    if (INLINE_J_TBL[c] === 0) {
+      dst[p++] = c;
+      i++;
+      continue;
+    }
+    if (c === 10) { dst[p++] = 92; dst[p++] = 110; i++; continue; }
+    if (c === 39) { dst[p++]=38; dst[p++]=35; dst[p++]=51; dst[p++]=57; dst[p++]=59; i++; continue; }
+    if (c === 34) { dst[p++]=38; dst[p++]=113; dst[p++]=117; dst[p++]=111; dst[p++]=116; dst[p++]=59; i++; continue; }
+    if (c === 38) { dst[p++]=38; dst[p++]=97; dst[p++]=109; dst[p++]=112; dst[p++]=59; i++; continue; }
+    if (c === 60) { dst[p++]=38; dst[p++]=108; dst[p++]=116; dst[p++]=59; i++; continue; }
+    if (c === 62) { dst[p++]=38; dst[p++]=103; dst[p++]=116; dst[p++]=59; i++; continue; }
+    break;
+  }
+  slab.pos = p;
+  return i;
+}
+
+// Capacity already pre-ensured for the entire markdown file in mdSlab!
 function writeInlineJSlab(s, start, end, linkCtx, slab) {
-  if (start >= end) return;
-  const maxNeed = (end - start) * 6 + 64;
-  if (slab.pos + maxNeed > slab.cap) growSlab(slab, maxNeed);
   let i = start;
   while (i < end) {
     i = scanInlineFast(s, i, end, slab);
@@ -2487,7 +1209,6 @@ function writeInlineJSlab(s, start, end, linkCtx, slab) {
           slab.pos = p0;
           const k = scanInlineFast(s, i + 2, j, slab);
           if (k < j) writeInlineJSlab(s, k, j, linkCtx, slab);
-          if (slab.pos + (end - j) * 6 + 64 > slab.cap) growSlab(slab, (end - j) * 6 + 64);
           const d1 = slab.buf; let p1 = slab.pos;
           d1[p1++]=60; d1[p1++]=47; d1[p1++]=115; d1[p1++]=116; d1[p1++]=114; d1[p1++]=111; d1[p1++]=110; d1[p1++]=103; d1[p1++]=62;
           slab.pos = p1;
@@ -2505,7 +1226,6 @@ function writeInlineJSlab(s, start, end, linkCtx, slab) {
         slab.pos = p0;
         const k = scanInlineFast(s, i + 1, j, slab);
         if (k < j) writeInlineJSlab(s, k, j, linkCtx, slab);
-        if (slab.pos + (end - j) * 6 + 64 > slab.cap) growSlab(slab, (end - j) * 6 + 64);
         const d1 = slab.buf; let p1 = slab.pos;
         d1[p1++]=60; d1[p1++]=47; d1[p1++]=101; d1[p1++]=109; d1[p1++]=62;
         slab.pos = p1;
@@ -2523,7 +1243,6 @@ function writeInlineJSlab(s, start, end, linkCtx, slab) {
         d0[p0++]=60; d0[p0++]=99; d0[p0++]=111; d0[p0++]=100; d0[p0++]=101; d0[p0++]=62;
         slab.pos = p0;
         writeHtmlJSlab(s, i + 1, j, slab);
-        if (slab.pos + (end - j) * 6 + 64 > slab.cap) growSlab(slab, (end - j) * 6 + 64);
         const d1 = slab.buf; let p1 = slab.pos;
         d1[p1++]=60; d1[p1++]=47; d1[p1++]=99; d1[p1++]=111; d1[p1++]=100; d1[p1++]=101; d1[p1++]=62;
         slab.pos = p1;
@@ -2540,15 +1259,13 @@ function writeInlineJSlab(s, start, end, linkCtx, slab) {
       if (m !== -1 && m < end && m > k + 2) {
         const target = s.slice(k + 2, m);
         let aBuf = linkCtx.aBufMap.get(target);
-        if (aBuf === undefined) {
-          if (!hasWhitespace(target)) {
-            aBuf = resolveLinkATagBuf(linkCtx, target);
-          }
+        if (aBuf === undefined && !hasWhitespace(target)) {
+          aBuf = resolveLinkATagBuf(linkCtx, target);
         }
         if (aBuf !== undefined) {
-          writeSlabBuf(slab, aBuf);
+          slab.buf.set(aBuf, slab.pos);
+          slab.pos += aBuf.length;
           writeInlineJSlab(s, i + 1, k, linkCtx, slab);
-          if (slab.pos + (end - m) * 6 + 64 > slab.cap) growSlab(slab, (end - m) * 6 + 64);
           const d1 = slab.buf; let p1 = slab.pos;
           d1[p1++]=60; d1[p1++]=47; d1[p1++]=97; d1[p1++]=62;
           slab.pos = p1;
@@ -2585,33 +1302,14 @@ function writeInlineJSlab(s, start, end, linkCtx, slab) {
       i++;
       continue;
     }
-    writeHtmlJChar(c, slab);
+    slab.pos = writeJCtrlChar(c, slab.buf, slab.pos);
     i++;
   }
 }
 
-const B_H_OPEN = [
-  null,
-  Buffer.from('<h1 id=\\"'),
-  Buffer.from('<h2 id=\\"'),
-  Buffer.from('<h3 id=\\"'),
-  Buffer.from('<h4 id=\\"'),
-  Buffer.from('<h5 id=\\"'),
-  Buffer.from('<h6 id=\\"'),
-];
-const B_H_MID = Buffer.from('\\">');
-const B_H_CLOSE = [
-  null,
-  Buffer.from('</h1>\\n'),
-  Buffer.from('</h2>\\n'),
-  Buffer.from('</h3>\\n'),
-  Buffer.from('</h4>\\n'),
-  Buffer.from('</h5>\\n'),
-  Buffer.from('</h6>\\n'),
-];
-
 function renderMarkdownSlab(src, linkCtx, slugCache, ids, mdSlab) {
   const srcLen = src.length;
+  if (mdSlab.pos + srcLen * 8 + 4096 > mdSlab.cap) growSlab(mdSlab, srcLen * 8 + 4096);
   if (ids.size > 0) ids.clear();
   const toc = [];
   const htmlStart = mdSlab.pos;
@@ -2622,8 +1320,13 @@ function renderMarkdownSlab(src, linkCtx, slugCache, ids, mdSlab) {
   while (pos <= srcLen) {
     const nl = src.indexOf('\n', pos);
     const end = nl === -1 ? srcLen : nl;
-    if (startIsBlank(src, pos, end)) { if (nl === -1) break; pos = nl + 1; continue; }
+    if (pos === end) { if (nl === -1) break; pos = nl + 1; continue; }
     const c0 = src.charCodeAt(pos);
+    if ((c0 === 32 || c0 === 9) && isBlankSlice(src, pos + 1, end)) {
+      if (nl === -1) break;
+      pos = nl + 1;
+      continue;
+    }
     const nextPos = nl === -1 ? srcLen + 1 : nl + 1;
     if (c0 === 96) {
       const langEnd = fenceLangEnd(src, pos, end);
@@ -2645,7 +1348,7 @@ function renderMarkdownSlab(src, linkCtx, slugCache, ids, mdSlab) {
           if (codeEnd > codeStart) writeHtmlJSlab(src, codeStart, codeEnd, mdSlab);
         } else if (codeStart <= srcLen) {
           writeHtmlJSlab(src, codeStart, srcLen, mdSlab);
-          writeRawStr('\\n', mdSlab);
+          const d = mdSlab.buf; d[mdSlab.pos++] = 92; d[mdSlab.pos++] = 110;
         }
         writeSlabBuf(mdSlab, B_PRE_CLOSE);
         continue;
@@ -2660,13 +1363,20 @@ function renderMarkdownSlab(src, linkCtx, slugCache, ids, mdSlab) {
           let he = end; while (he > hs && (src.charCodeAt(he - 1) === 32 || src.charCodeAt(he - 1) === 9)) he--;
           if (hs < he) {
             const id = uniqueSlug(slugifyCached(slugCache, src.slice(hs, he)), ids);
-            writeSlabBuf(mdSlab, B_H_OPEN[d]);
+            const buf = mdSlab.buf;
+            let p = mdSlab.pos;
+            buf[p++]=60; buf[p++]=104; buf[p++]=48+d; buf[p++]=32; buf[p++]=105; buf[p++]=100; buf[p++]=61; buf[p++]=92; buf[p++]=34;
+            mdSlab.pos = p;
             writeRawStr(id, mdSlab);
-            writeSlabBuf(mdSlab, B_H_MID);
-            const hStart = mdSlab.pos;
+            p = mdSlab.pos;
+            buf[p++]=92; buf[p++]=34; buf[p++]=62;
+            mdSlab.pos = p;
+            const hStart = p;
             writeInlineJSlab(src, hs, he, linkCtx, mdSlab);
             const hEnd = mdSlab.pos;
-            writeSlabBuf(mdSlab, B_H_CLOSE[d]);
+            p = hEnd;
+            buf[p++]=60; buf[p++]=47; buf[p++]=104; buf[p++]=48+d; buf[p++]=62; buf[p++]=92; buf[p++]=110;
+            mdSlab.pos = p;
             if (d === 2 || d === 3) toc.push({ level: d, id, htmlStart: hStart, htmlEnd: hEnd });
             pos = nextPos; continue;
           }
@@ -2674,19 +1384,30 @@ function renderMarkdownSlab(src, linkCtx, slugCache, ids, mdSlab) {
       }
     }
     if (c0 === 45 || c0 === 42) {
-      if (isHrSlice(src, pos, end, c0)) { writeSlabBuf(mdSlab, B_HR); pos = nextPos; continue; }
+      if (isHrSlice(src, pos, end, c0)) {
+        const d = mdSlab.buf; let p = mdSlab.pos;
+        d[p++]=60; d[p++]=104; d[p++]=114; d[p++]=62; d[p++]=92; d[p++]=110;
+        mdSlab.pos = p;
+        pos = nextPos; continue;
+      }
       if (pos + 1 < end && src.charCodeAt(pos + 1) === 32) {
-        writeSlabBuf(mdSlab, B_UL_OPEN);
+        const d = mdSlab.buf; let p = mdSlab.pos;
+        d[p++]=60; d[p++]=117; d[p++]=108; d[p++]=62; d[p++]=92; d[p++]=110;
+        mdSlab.pos = p;
         let curStart = pos + 2; while (curStart < end && (src.charCodeAt(curStart) === 32 || src.charCodeAt(curStart) === 9)) curStart++;
         let curEnd = end; while (curEnd > curStart && (src.charCodeAt(curEnd - 1) === 32 || src.charCodeAt(curEnd - 1) === 9)) curEnd--;
         let curItem = null; pos = nextPos;
         while (pos <= srcLen) {
           const nl2 = src.indexOf('\n', pos); const end2 = nl2 === -1 ? srcLen : nl2;
           if (isBulletSlice(src, pos, end2)) {
-            writeSlabBuf(mdSlab, B_LI_OPEN);
+            let dp = mdSlab.pos;
+            d[dp++]=60; d[dp++]=108; d[dp++]=105; d[dp++]=62;
+            mdSlab.pos = dp;
             if (curItem === null) writeInlineJSlab(src, curStart, curEnd, linkCtx, mdSlab);
             else writeInlineJSlab(curItem, 0, curItem.length, linkCtx, mdSlab);
-            writeSlabBuf(mdSlab, B_LI_CLOSE);
+            dp = mdSlab.pos;
+            d[dp++]=60; d[dp++]=47; d[dp++]=108; d[dp++]=105; d[dp++]=62; d[dp++]=92; d[dp++]=110;
+            mdSlab.pos = dp;
             curStart = pos + 2; while (curStart < end2 && (src.charCodeAt(curStart) === 32 || src.charCodeAt(curStart) === 9)) curStart++;
             curEnd = end2; while (curEnd > curStart && (src.charCodeAt(curEnd - 1) === 32 || src.charCodeAt(curEnd - 1) === 9)) curEnd--;
             curItem = null; pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
@@ -2695,11 +1416,15 @@ function renderMarkdownSlab(src, linkCtx, slugCache, ids, mdSlab) {
             curItem += `\n${trimSlice(src, pos, end2)}`; pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
           } else break;
         }
-        writeSlabBuf(mdSlab, B_LI_OPEN);
+        let dp = mdSlab.pos;
+        d[dp++]=60; d[dp++]=108; d[dp++]=105; d[dp++]=62;
+        mdSlab.pos = dp;
         if (curItem === null) writeInlineJSlab(src, curStart, curEnd, linkCtx, mdSlab);
         else writeInlineJSlab(curItem, 0, curItem.length, linkCtx, mdSlab);
-        writeSlabBuf(mdSlab, B_LI_CLOSE);
-        writeSlabBuf(mdSlab, B_UL_CLOSE);
+        dp = mdSlab.pos;
+        d[dp++]=60; d[dp++]=47; d[dp++]=108; d[dp++]=105; d[dp++]=62; d[dp++]=92; d[dp++]=110;
+        d[dp++]=60; d[dp++]=47; d[dp++]=117; d[dp++]=108; d[dp++]=62; d[dp++]=92; d[dp++]=110;
+        mdSlab.pos = dp;
         continue;
       }
     }
@@ -2727,8 +1452,13 @@ function renderMarkdownSlab(src, linkCtx, slugCache, ids, mdSlab) {
       const contentPos = orderedStartSlice(src, pos, end);
       if (contentPos !== -1) {
         const start = contentPos - 2 === pos + 1 ? c0 - 48 : Number(src.slice(pos, contentPos - 2));
+        const d = mdSlab.buf;
         if (start !== 1) writeRawStr(`<ol start=\\"${start}\\">\\n`, mdSlab);
-        else writeSlabBuf(mdSlab, B_OL_OPEN);
+        else {
+          let dp = mdSlab.pos;
+          d[dp++]=60; d[dp++]=111; d[dp++]=108; d[dp++]=62; d[dp++]=92; d[dp++]=110;
+          mdSlab.pos = dp;
+        }
         let curStart = contentPos; while (curStart < end && (src.charCodeAt(curStart) === 32 || src.charCodeAt(curStart) === 9)) curStart++;
         let curEnd = end; while (curEnd > curStart && (src.charCodeAt(curEnd - 1) === 32 || src.charCodeAt(curEnd - 1) === 9)) curEnd--;
         let curItem = null; pos = nextPos;
@@ -2736,10 +1466,14 @@ function renderMarkdownSlab(src, linkCtx, slugCache, ids, mdSlab) {
           const nl2 = src.indexOf('\n', pos); const end2 = nl2 === -1 ? srcLen : nl2;
           const cPos2 = orderedStartSlice(src, pos, end2);
           if (cPos2 !== -1) {
-            writeSlabBuf(mdSlab, B_LI_OPEN);
+            let dp = mdSlab.pos;
+            d[dp++]=60; d[dp++]=108; d[dp++]=105; d[dp++]=62;
+            mdSlab.pos = dp;
             if (curItem === null) writeInlineJSlab(src, curStart, curEnd, linkCtx, mdSlab);
             else writeInlineJSlab(curItem, 0, curItem.length, linkCtx, mdSlab);
-            writeSlabBuf(mdSlab, B_LI_CLOSE);
+            dp = mdSlab.pos;
+            d[dp++]=60; d[dp++]=47; d[dp++]=108; d[dp++]=105; d[dp++]=62; d[dp++]=92; d[dp++]=110;
+            mdSlab.pos = dp;
             curStart = cPos2; while (curStart < end2 && (src.charCodeAt(curStart) === 32 || src.charCodeAt(curStart) === 9)) curStart++;
             curEnd = end2; while (curEnd > curStart && (src.charCodeAt(curEnd - 1) === 32 || src.charCodeAt(curEnd - 1) === 9)) curEnd--;
             curItem = null; pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
@@ -2748,11 +1482,15 @@ function renderMarkdownSlab(src, linkCtx, slugCache, ids, mdSlab) {
             curItem += `\n${trimSlice(src, pos, end2)}`; pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
           } else break;
         }
-        writeSlabBuf(mdSlab, B_LI_OPEN);
+        let dp = mdSlab.pos;
+        d[dp++]=60; d[dp++]=108; d[dp++]=105; d[dp++]=62;
+        mdSlab.pos = dp;
         if (curItem === null) writeInlineJSlab(src, curStart, curEnd, linkCtx, mdSlab);
         else writeInlineJSlab(curItem, 0, curItem.length, linkCtx, mdSlab);
-        writeSlabBuf(mdSlab, B_LI_CLOSE);
-        writeSlabBuf(mdSlab, B_OL_CLOSE);
+        dp = mdSlab.pos;
+        d[dp++]=60; d[dp++]=47; d[dp++]=108; d[dp++]=105; d[dp++]=62; d[dp++]=92; d[dp++]=110;
+        d[dp++]=60; d[dp++]=47; d[dp++]=111; d[dp++]=108; d[dp++]=62; d[dp++]=92; d[dp++]=110;
+        mdSlab.pos = dp;
         continue;
       }
     }
@@ -2789,8 +1527,11 @@ function renderMarkdownSlab(src, linkCtx, slugCache, ids, mdSlab) {
       }
       pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
     }
-    writeSlabBuf(mdSlab, B_P_OPEN);
-    const pEx0 = mdSlab.pos;
+    const d = mdSlab.buf;
+    let dp = mdSlab.pos;
+    d[dp++]=60; d[dp++]=112; d[dp++]=62;
+    mdSlab.pos = dp;
+    const pEx0 = dp;
     if (pLines === null) {
       writeInlineJSlab(src, pStart, pLastEnd, linkCtx, mdSlab);
     } else {
@@ -2803,7 +1544,9 @@ function renderMarkdownSlab(src, linkCtx, slugCache, ids, mdSlab) {
       exStart = pEx0;
       exEnd = pEx1;
     }
-    writeSlabBuf(mdSlab, B_P_CLOSE);
+    dp = pEx1;
+    d[dp++]=60; d[dp++]=47; d[dp++]=112; d[dp++]=62; d[dp++]=92; d[dp++]=110;
+    mdSlab.pos = dp;
   }
   return { htmlStart, htmlEnd: mdSlab.pos, exStart, exEnd, toc };
 }
@@ -2992,8 +1735,8 @@ function compileTemplateBodySlab(flat, extraVars, itemCaches, dynRoots, isItem, 
           lines.push(`for(let ${idxVar}=0;${idxVar}<${lenVar};${idxVar}++){`);
           lines.push(`const ${itemVar}=${arrVar}[${idxVar}];`);
           lines.push(`let _r${cid}=_c${cid}.get(${itemVar});`);
-          lines.push(`if(_r${cid}===undefined){const _s0=_cs${cid}.pos;_f${cid}(${itemVar},_cs${cid},_md);_r${cid}=[_s0,_cs${cid}.pos];_c${cid}.set(${itemVar},_r${cid});}`);
-          lines.push(`_wS(_slab,_cs${cid}.buf,_r${cid}[0],_r${cid}[1]);`);
+          lines.push(`if(_r${cid}===undefined){const _s0=_cs${cid}.pos;_f${cid}(${itemVar},_cs${cid},_md);_r${cid}=_s0*16777216+_cs${cid}.pos;_c${cid}.set(${itemVar},_r${cid});}`);
+          lines.push(`const _e${cid}=_r${cid}%16777216;const _s${cid}=(_r${cid}-_e${cid})/16777216;_wS(_slab,_cs${cid}.buf,_s${cid},_e${cid});`);
           lines.push('}}');
         } else {
           const needBareLoop = bodyUsesBareLoop(n.body);
@@ -3038,7 +1781,6 @@ const B_QUOTE_CLOSE = Buffer.from('"}');
 const B_KEY_SEP_FIRST = Buffer.from('"');
 const B_KEY_SEP_NEXT = Buffer.from('","');
 const B_KEY_COLON_QUOTE = Buffer.from('":"');
-const B_INDEX_HTML = Buffer.from('index.html');
 const B_TAGS_INDEX_HTML = Buffer.from('tags/index.html');
 const B_REPORT_FILE = Buffer.from(REPORT_FILE);
 
@@ -3052,19 +1794,18 @@ function slugifyCached(slugCache, text) {
 }
 
 function cachedLongDateFrom(dateCache, d) {
-  let ld = dateCache.get(d);
-  if (ld === undefined) {
-    ld = longDate(d);
-    dateCache.set(d, ld);
+  let dl = dateCache.get(d);
+  if (dl === undefined) {
+    dl = longDate(d);
+    dateCache.set(d, dl);
   }
-  return ld;
+  return dl;
 }
 
 function linkOfCached(dateCache, s) {
   if (s === null) return null;
   if (s.link !== undefined) return s.link;
-  const dl = s.data.date === undefined ? '' : cachedLongDateFrom(dateCache, s.data.date);
-  s.dateLong = dl;
+  const dl = s.dateLong ?? (s.data.date === undefined ? '' : cachedLongDateFrom(dateCache, s.data.date));
   s.link = {
     title: s.data.title,
     url: s.url,
@@ -3111,13 +1852,13 @@ function runCoreSlab(input, outSlab, mdSlab, cardSlab) {
   const kept = [];
   for (let i = 0; i < sources.length; i++) {
     const s = sources[i];
-    const fm = parseFrontMatter(s.text);
-    if ('error' in fm) {
-      report.push(`refused ${s.path}: ${fm.error}`);
+    const fmErr = parseFrontMatter(s.text);
+    if (fmErr !== null) {
+      report.push(`refused ${s.path}: ${fmErr}`);
       continue;
     }
-    s.data = fm.data;
-    s.body = fm.body;
+    s.data = fmData;
+    s.body = fmBody;
     const post = s.path.startsWith('posts/');
     s.post = post;
     if (!post) {
@@ -3172,7 +1913,7 @@ function runCoreSlab(input, outSlab, mdSlab, cardSlab) {
   const urlCaches = new Map();
   const aBufCaches = new Map();
   const emptyParts = [];
-  const linkCtx = { srcPath: '', dir: '', dirParts: emptyParts, bySource, staticPaths, base, broken, relCache: new Map(), urlMap: null, aBufMap: null, extMap: new Map(), safeUrls, jm: true };
+  const linkCtx = { srcPath: '', dir: '', dirParts: emptyParts, bySource, staticPaths, base, broken, relCache: new Map(), urlMap: null, aBufMap: null, extMap: new Map(), safeUrls };
   const mdIds = new Set();
   for (let i = 0; i < kept.length; i++) {
     const s = kept[i];
@@ -3320,7 +2061,7 @@ function runCoreSlab(input, outSlab, mdSlab, cardSlab) {
       const folded = [];
       const dyn = DYN_BY_KIND[kind];
       const tru = TRUTHY_BY_KIND[kind];
-      foldAst(inlined, staticEnv, emptyBound, dyn, tru, folded, true);
+      foldAst(inlined, staticEnv, emptyBound, dyn, tru, folded);
       const fn = compileTemplateBodySlab(folded, staticEnv, itemCaches, dyn, null, safeUrls, cardSlab);
       r = { fn, needsRm: astUsesProp(folded, 'reading_minutes') };
       compiled.set(key, r);
@@ -3505,5 +2246,10 @@ export function solveCasesToBuffer(cases) {
   return outSlab.buf.subarray(0, outSlab.pos);
 }
 
-export function run(input) { return runCore(input, false); }
-export function runJson(input) { return runCore(input, true); }
+export function run(input) {
+  const outSlab = makeSlab(4 * 1024 * 1024);
+  const mdSlab = makeSlab(2 * 1024 * 1024);
+  const cardSlab = makeSlab(256 * 1024);
+  runCoreSlab(input, outSlab, mdSlab, cardSlab);
+  return JSON.parse(outSlab.buf.toString('utf8', 0, outSlab.pos));
+}
