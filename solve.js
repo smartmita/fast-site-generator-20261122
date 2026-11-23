@@ -19,6 +19,46 @@ const escRepl = (m) => ESC_MAP[m];
 function escapeHtml(s) {
   return ESC_TEST.test(s) ? s.replace(ESC_RE, escRepl) : s;
 }
+const JESC_TEST = /[\\"\x00-\x1f]/;
+const JESC_RE = /[\\"\x00-\x1f]/g;
+function jEscRepl(ch) {
+  const c = ch.charCodeAt(0);
+  if (c === 34) return '\\"';
+  if (c === 92) return '\\\\';
+  if (c === 10) return '\\n';
+  if (c === 13) return '\\r';
+  if (c === 9) return '\\t';
+  if (c === 8) return '\\b';
+  if (c === 12) return '\\f';
+  return c < 16 ? '\\u000' + c.toString(16) : '\\u00' + c.toString(16);
+}
+function jStr(s) {
+  return JESC_TEST.test(s) ? s.replace(JESC_RE, jEscRepl) : s;
+}
+const ESCJ_TEST = /[&<>"'\\\x00-\x1f]/;
+const ESCJ_RE = /[&<>"'\\\x00-\x1f]/g;
+function escJRepl(ch) {
+  switch (ch) {
+    case '&': return '&amp;';
+    case '<': return '&lt;';
+    case '>': return '&gt;';
+    case '"': return '&quot;';
+    case "'": return '&#39;';
+    case '\\': return '\\\\';
+    case '\n': return '\\n';
+    case '\r': return '\\r';
+    case '\t': return '\\t';
+    case '\b': return '\\b';
+    case '\f': return '\\f';
+    default: {
+      const c = ch.charCodeAt(0);
+      return c < 16 ? '\\u000' + c.toString(16) : '\\u00' + c.toString(16);
+    }
+  }
+}
+function escapeHtmlJ(s) {
+  return ESCJ_TEST.test(s) ? s.replace(ESCJ_RE, escJRepl) : s;
+}
 
 function slugifyRaw(text) {
   const len = text.length;
@@ -87,19 +127,18 @@ function isJsWhitespace(c) {
 function wordsOf(text) {
   const len = text.length;
   let count = 0;
-  let inWord = false;
-  for (let i = 0; i < len; i++) {
-    const c = text.charCodeAt(i);
-    if (c > 32 && c < 128) {
-      if (!inWord) {
-        inWord = true;
-        count++;
+  for (let i = 0; i < len; ) {
+    let c = text.charCodeAt(i);
+    while (c === 32 || (c >= 9 && c <= 13) || (c >= 128 && isJsWhitespace(c))) {
+      if (++i >= len) return count;
+      c = text.charCodeAt(i);
+    }
+    count++;
+    while (++i < len) {
+      c = text.charCodeAt(i);
+      if (c <= 32 || c >= 128) {
+        if (c === 32 || (c >= 9 && c <= 13) || (c >= 128 && isJsWhitespace(c))) break;
       }
-    } else if (c === 32 || (c >= 9 && c <= 13) || (c >= 128 && isJsWhitespace(c))) {
-      inWord = false;
-    } else if (!inWord) {
-      inWord = true;
-      count++;
     }
   }
   return count;
@@ -163,15 +202,20 @@ function fmValueOf(key, raw) {
       return 'error' in s ? { error: `key "${key}": ${s.error}` } : s;
     }
     case 'date': {
-      const m = DATE_RE.exec(raw);
-      if (!m) return { error: 'key "date": not a date from 1970-01-01 to 2099-12-31 (YYYY-MM-DD)' };
-      const y = Number(m[1]);
-      const mo = Number(m[2]);
-      const d = Number(m[3]);
-      if (y < 1970 || y > 2099 || mo < 1 || mo > 12 || d < 1 || d > daysIn(y, mo)) {
-        return { error: 'key "date": not a date from 1970-01-01 to 2099-12-31 (YYYY-MM-DD)' };
+      if (raw.length === 10 && raw.charCodeAt(4) === 45 && raw.charCodeAt(7) === 45) {
+        const y0 = raw.charCodeAt(0) - 48, y1 = raw.charCodeAt(1) - 48, y2 = raw.charCodeAt(2) - 48, y3 = raw.charCodeAt(3) - 48;
+        const m0 = raw.charCodeAt(5) - 48, m1 = raw.charCodeAt(6) - 48;
+        const d0 = raw.charCodeAt(8) - 48, d1 = raw.charCodeAt(9) - 48;
+        if ((y0 | y1 | y2 | y3 | m0 | m1 | d0 | d1) >= 0 && y0 <= 9 && y1 <= 9 && y2 <= 9 && y3 <= 9 && m0 <= 9 && m1 <= 9 && d0 <= 9 && d1 <= 9) {
+          const y = y0 * 1000 + y1 * 100 + y2 * 10 + y3;
+          const mo = m0 * 10 + m1;
+          const d = d0 * 10 + d1;
+          if (y >= 1970 && y <= 2099 && mo >= 1 && mo <= 12 && d >= 1 && d <= daysIn(y, mo)) {
+            return { value: raw };
+          }
+        }
       }
-      return { value: raw };
+      return { error: 'key "date": not a date from 1970-01-01 to 2099-12-31 (YYYY-MM-DD)' };
     }
     case 'tags': {
       if (raw.charCodeAt(0) !== 91 || raw.charCodeAt(raw.length - 1) !== 93) return { error: 'key "tags": not a list [a, b]' };
@@ -312,6 +356,7 @@ function findSingleStar(s, from, end, hasSlash) {
 }
 
 const ALL_RE = /[\\`*[&<>"']/g;
+const MD_ONLY_RE = /[\\`*[]/g;
 
 function inlineRange(s, start, end, resolveLink, linkCtx) {
   if (start >= end) return '';
@@ -319,8 +364,14 @@ function inlineRange(s, start, end, resolveLink, linkCtx) {
   if (!ALL_RE.test(s) || ALL_RE.lastIndex - 1 >= end) {
     return start === 0 && end === s.length ? s : s.slice(start, end);
   }
-  const sl = s.indexOf('\\', start);
-  return inlineRec(s, start, end, resolveLink, linkCtx, sl !== -1 && sl < end, ALL_RE.lastIndex - 1);
+  const firstIdx = ALL_RE.lastIndex - 1;
+  MD_ONLY_RE.lastIndex = firstIdx;
+  if (!MD_ONLY_RE.test(s) || MD_ONLY_RE.lastIndex - 1 >= end) {
+    const sub = start === 0 && end === s.length ? s : s.slice(start, end);
+    return sub.replace(ESC_RE, escRepl);
+  }
+  const sl = s.indexOf('\\', MD_ONLY_RE.lastIndex - 1);
+  return inlineRec(s, start, end, resolveLink, linkCtx, sl !== -1 && sl < end, firstIdx);
 }
 
 function inlineRec(s, start, end, resolveLink, linkCtx, hasSlash, firstIdx) {
@@ -719,6 +770,240 @@ function renderMarkdown(src, resolveLink, linkCtx, slugify) {
   return { html: out, toc, excerpt: excerpt ?? '' };
 }
 
+
+
+const CTRL_NO_NL = /[\x00-\x09\x0b-\x1f]/;
+const ALLJ_RE = /[\\`*[&<>"'\x00-\x1f]/g;
+const ALLJ_FAST_RE = /[\\`*[&<>"']/g;
+const NL_RE = /\n/g;
+
+function inlineRangeJ(s, start, end, resolveLink, linkCtx, allowNl, multiLine) {
+  if (start >= end) return '';
+  if (!allowNl) {
+    ALLJ_RE.lastIndex = start;
+    if (!ALLJ_RE.test(s) || ALLJ_RE.lastIndex - 1 >= end) return start === 0 && end === s.length ? s : s.slice(start, end);
+    const sl = s.indexOf('\\', start);
+    return inlineRecJ(s, start, end, resolveLink, linkCtx, sl !== -1 && sl < end, ALLJ_RE.lastIndex - 1, ALLJ_RE);
+  }
+  ALLJ_FAST_RE.lastIndex = start;
+  if (!ALLJ_FAST_RE.test(s) || ALLJ_FAST_RE.lastIndex - 1 >= end) {
+    const sub = start === 0 && end === s.length ? s : s.slice(start, end);
+    return multiLine && sub.includes('\n') ? sub.replace(NL_RE, '\\n') : sub;
+  }
+  const firstIdx = ALLJ_FAST_RE.lastIndex - 1;
+  MD_ONLY_RE.lastIndex = firstIdx;
+  let res;
+  if (!MD_ONLY_RE.test(s) || MD_ONLY_RE.lastIndex - 1 >= end) {
+    const sub = start === 0 && end === s.length ? s : s.slice(start, end);
+    res = sub.replace(ESC_RE, escRepl);
+  } else {
+    const sl = s.indexOf('\\', MD_ONLY_RE.lastIndex - 1);
+    res = inlineRecJ(s, start, end, resolveLink, linkCtx, sl !== -1 && sl < end, firstIdx, ALLJ_FAST_RE);
+  }
+  return multiLine && res.includes('\n') ? res.replace(NL_RE, '\\n') : res;
+}
+
+function inlineRecJ(s, start, end, resolveLink, linkCtx, hasSlash, firstIdx, re) {
+  let idx = firstIdx;
+  if (idx === -1) {
+    re.lastIndex = start;
+    if (!re.test(s) || re.lastIndex - 1 >= end) {
+      return start === 0 && end === s.length ? s : s.slice(start, end);
+    }
+    idx = re.lastIndex - 1;
+  }
+  let out = idx > start ? s.slice(start, idx) : '';
+  let i = idx;
+  while (true) {
+    const c = s.charCodeAt(idx);
+    if (c <= 62) {
+      if (c === 42) {
+        if (idx + 1 < end && s.charCodeAt(idx + 1) === 42) {
+          const j = findUnescaped(s, '**', idx + 2, end, hasSlash);
+          if (j > idx + 2) {
+            out += '<strong>' + inlineRecJ(s, idx + 2, j, resolveLink, linkCtx, hasSlash, -1, re) + '</strong>';
+            i = j + 2;
+          } else { out += '**'; i = idx + 2; }
+        } else {
+          const j = findSingleStar(s, idx + 1, end, hasSlash);
+          if (j > idx + 1) {
+            out += '<em>' + inlineRecJ(s, idx + 1, j, resolveLink, linkCtx, hasSlash, -1, re) + '</em>';
+            i = j + 1;
+          } else { out += '*'; i = idx + 1; }
+        }
+      } else if (c < 32) {
+        if (c === 10) out += '\\n';
+        else if (c === 13) out += '\\r';
+        else if (c === 9) out += '\\t';
+        else if (c === 8) out += '\\b';
+        else if (c === 12) out += '\\f';
+        else out += c < 16 ? '\\u000' + c.toString(16) : '\\u00' + c.toString(16);
+        i = idx + 1;
+      } else if (c === 39) { out += '&#39;'; i = idx + 1; }
+      else if (c === 34) { out += '&quot;'; i = idx + 1; }
+      else if (c === 38) { out += '&amp;'; i = idx + 1; }
+      else if (c === 60) { out += '&lt;'; i = idx + 1; }
+      else { out += '&gt;'; i = idx + 1; }
+    } else if (c === 92) {
+      if (idx + 1 < end) {
+        const nc = s.charCodeAt(idx + 1);
+        if (nc < 128 && ESCAPABLE[nc]) {
+          out += nc === 62 ? '&gt;' : (nc === 92 ? '\\\\' : s[idx + 1]);
+          i = idx + 2;
+        } else { out += '\\\\'; i = idx + 1; }
+      } else { out += '\\\\'; i = idx + 1; }
+    } else if (c === 96) {
+      const j = s.indexOf('`', idx + 1);
+      if (j > idx + 1 && j < end) {
+        out += '<code>' + escapeHtmlJ(s.slice(idx + 1, j)) + '</code>';
+        i = j + 1;
+      } else { out += '`'; i = idx + 1; }
+    } else {
+      const k = findUnescaped(s, ']', idx + 1, end, hasSlash);
+      const m = k !== -1 && k + 1 < end && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
+      const target = m !== -1 && m < end ? s.slice(k + 2, m) : '';
+      if (target !== '' && !hasWhitespace(target)) {
+        out += '<a href=\\"' + resolveLink(linkCtx, target) + '\\">' + inlineRecJ(s, idx + 1, k, resolveLink, linkCtx, hasSlash, -1, re) + '</a>';
+        i = m + 1;
+      } else { out += '['; i = idx + 1; }
+    }
+    if (i >= end) break;
+    re.lastIndex = i;
+    if (!re.test(s) || re.lastIndex - 1 >= end) { out += s.slice(i, end); break; }
+    idx = re.lastIndex - 1;
+    if (idx > i) out += s.slice(i, idx);
+  }
+  return out;
+}
+
+function renderMarkdownJ(src, resolveLink, linkCtx, slugify) {
+  const allowNl = !CTRL_NO_NL.test(src);
+  const srcLen = src.length;
+  const ids = new Set();
+  const toc = [];
+  let excerpt = null;
+  let out = '';
+  let pos = 0;
+  while (pos <= srcLen) {
+    const nl = src.indexOf('\n', pos);
+    const end = nl === -1 ? srcLen : nl;
+    if (startIsBlank(src, pos, end)) { if (nl === -1) break; pos = nl + 1; continue; }
+    const c0 = src.charCodeAt(pos);
+    const nextPos = nl === -1 ? srcLen + 1 : nl + 1;
+    if (c0 === 96) {
+      const langEnd = fenceLangEnd(src, pos, end);
+      if (langEnd !== -1) {
+        const openTag = langEnd === pos + 3 ? '<pre><code>' : `<pre><code class=\\"language-${escapeHtmlJ(src.slice(pos + 3, langEnd))}\\">`;
+        pos = nextPos; const codeStart = pos; let closed = false, codeEnd = pos;
+        while (pos <= srcLen) {
+          const nl2 = src.indexOf('\n', pos); const end2 = nl2 === -1 ? srcLen : nl2;
+          if (isFenceCloseSlice(src, pos, end2)) { codeEnd = pos; pos = nl2 === -1 ? srcLen + 1 : nl2 + 1; closed = true; break; }
+          pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
+        }
+        const body = closed ? (codeEnd > codeStart ? escapeHtmlJ(src.slice(codeStart, codeEnd)) : '') : (codeStart <= srcLen ? `${escapeHtmlJ(src.slice(codeStart))}\\n` : '');
+        out += `${openTag}${body}</code></pre>\\n`;
+        continue;
+      }
+    }
+    if (c0 === 35) {
+      let d = 0; const max = Math.min(end, pos + 6); while (pos + d < max && src.charCodeAt(pos + d) === 35) d++;
+      if (d > 0 && pos + d < end) {
+        const sp = src.charCodeAt(pos + d);
+        if (sp === 32 || sp === 9) {
+          let hs = pos + d + 1; while (hs < end && (src.charCodeAt(hs) === 32 || src.charCodeAt(hs) === 9)) hs++;
+          let he = end; while (he > hs && (src.charCodeAt(he - 1) === 32 || src.charCodeAt(he - 1) === 9)) he--;
+          if (hs < he) {
+            const id = uniqueSlug(slugify(src.slice(hs, he)), ids);
+            const html = inlineRangeJ(src, hs, he, resolveLink, linkCtx, allowNl, false);
+            out += `<h${d} id=\\"${id}\\">${html}</h${d}>\\n`;
+            if (d === 2 || d === 3) toc.push({ __proto__: null, level: d, id, html });
+            pos = nextPos; continue;
+          }
+        }
+      }
+    }
+    if (c0 === 45 || c0 === 42) {
+      if (isHrSlice(src, pos, end, c0)) { out += '<hr>\\n'; pos = nextPos; continue; }
+      if (pos + 1 < end && src.charCodeAt(pos + 1) === 32) {
+        let listHtml = '<ul>\\n';
+        let curStart = pos + 2; while (curStart < end && (src.charCodeAt(curStart) === 32 || src.charCodeAt(curStart) === 9)) curStart++;
+        let curEnd = end; while (curEnd > curStart && (src.charCodeAt(curEnd - 1) === 32 || src.charCodeAt(curEnd - 1) === 9)) curEnd--;
+        let curItem = null; pos = nextPos;
+        while (pos <= srcLen) {
+          const nl2 = src.indexOf('\n', pos); const end2 = nl2 === -1 ? srcLen : nl2;
+          if (isBulletSlice(src, pos, end2)) {
+            listHtml += `<li>${curItem === null ? inlineRangeJ(src, curStart, curEnd, resolveLink, linkCtx, allowNl, false) : inlineRangeJ(curItem, 0, curItem.length, resolveLink, linkCtx, allowNl, true)}</li>\\n`;
+            curStart = pos + 2; while (curStart < end2 && (src.charCodeAt(curStart) === 32 || src.charCodeAt(curStart) === 9)) curStart++;
+            curEnd = end2; while (curEnd > curStart && (src.charCodeAt(curEnd - 1) === 32 || src.charCodeAt(curEnd - 1) === 9)) curEnd--;
+            curItem = null; pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
+          } else if (isContinuedSlice(src, pos, end2)) {
+            if (curItem === null) curItem = src.slice(curStart, curEnd);
+            curItem += `\n${trimSlice(src, pos, end2)}`; pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
+          } else break;
+        }
+        const lastHtml = curItem === null ? inlineRangeJ(src, curStart, curEnd, resolveLink, linkCtx, allowNl, false) : inlineRangeJ(curItem, 0, curItem.length, resolveLink, linkCtx, allowNl, true);
+        out += `${listHtml}<li>${lastHtml}</li>\\n</ul>\\n`; continue;
+      }
+    }
+    if (c0 === 62) {
+      let qText = ''; let first = true;
+      const s0 = pos + (pos + 1 < end && src.charCodeAt(pos + 1) === 32 ? 2 : 1);
+      const t0 = trimSlice(src, s0, end); if (t0 !== '') { qText = t0; first = false; }
+      pos = nextPos;
+      while (pos <= srcLen && src.charCodeAt(pos) === 62) {
+        const nl2 = src.indexOf('\n', pos); const end2 = nl2 === -1 ? srcLen : nl2;
+        const s2 = pos + (pos + 1 < end2 && src.charCodeAt(pos + 1) === 32 ? 2 : 1);
+        const t2 = trimSlice(src, s2, end2); if (t2 !== '') { qText = first ? t2 : `${qText}\n${t2}`; first = false; }
+        pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
+      }
+      out += first ? '<blockquote>\\n</blockquote>\\n' : `<blockquote>\\n<p>${inlineRangeJ(qText, 0, qText.length, resolveLink, linkCtx, allowNl, true)}</p>\\n</blockquote>\\n`;
+      continue;
+    }
+    if (c0 >= 48 && c0 <= 57) {
+      const contentPos = orderedStartSlice(src, pos, end);
+      if (contentPos !== -1) {
+        const start = contentPos - 2 === pos + 1 ? c0 - 48 : Number(src.slice(pos, contentPos - 2));
+        let listHtml = start !== 1 ? `<ol start=\\"${start}\\">\\n` : '<ol>\\n';
+        let curStart = contentPos; while (curStart < end && (src.charCodeAt(curStart) === 32 || src.charCodeAt(curStart) === 9)) curStart++;
+        let curEnd = end; while (curEnd > curStart && (src.charCodeAt(curEnd - 1) === 32 || src.charCodeAt(curEnd - 1) === 9)) curEnd--;
+        let curItem = null; pos = nextPos;
+        while (pos <= srcLen) {
+          const nl2 = src.indexOf('\n', pos); const end2 = nl2 === -1 ? srcLen : nl2;
+          const cPos2 = orderedStartSlice(src, pos, end2);
+          if (cPos2 !== -1) {
+            listHtml += `<li>${curItem === null ? inlineRangeJ(src, curStart, curEnd, resolveLink, linkCtx, allowNl, false) : inlineRangeJ(curItem, 0, curItem.length, resolveLink, linkCtx, allowNl, true)}</li>\\n`;
+            curStart = cPos2; while (curStart < end2 && (src.charCodeAt(curStart) === 32 || src.charCodeAt(curStart) === 9)) curStart++;
+            curEnd = end2; while (curEnd > curStart && (src.charCodeAt(curEnd - 1) === 32 || src.charCodeAt(curEnd - 1) === 9)) curEnd--;
+            curItem = null; pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
+          } else if (isContinuedSlice(src, pos, end2)) {
+            if (curItem === null) curItem = src.slice(curStart, curEnd);
+            curItem += `\n${trimSlice(src, pos, end2)}`; pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
+          } else break;
+        }
+        const lastHtml = curItem === null ? inlineRangeJ(src, curStart, curEnd, resolveLink, linkCtx, allowNl, false) : inlineRangeJ(curItem, 0, curItem.length, resolveLink, linkCtx, allowNl, true);
+        out += `${listHtml}<li>${lastHtml}</li>\\n</ol>\\n`; continue;
+      }
+    }
+    const p0Trimmed = pos < end && (c0 === 32 || c0 === 9 || src.charCodeAt(end - 1) === 32 || src.charCodeAt(end - 1) === 9);
+    const pStart = pos; let pLastEnd = end; let pLines = p0Trimmed ? [trimSlice(src, pos, end)] : null;
+    let pMulti = false;
+    pos = nextPos;
+    while (pos <= srcLen) {
+      const nl2 = src.indexOf('\n', pos); const end2 = nl2 === -1 ? srcLen : nl2;
+      if (endsParagraph(src, pos, end2)) break;
+      pMulti = true;
+      const needTrim = pos < end2 && (src.charCodeAt(pos) === 32 || src.charCodeAt(pos) === 9 || src.charCodeAt(end2 - 1) === 32 || src.charCodeAt(end2 - 1) === 9);
+      if (pLines === null) { if (needTrim) pLines = [src.slice(pStart, pLastEnd), trimSlice(src, pos, end2)]; else pLastEnd = end2; }
+      else pLines.push(needTrim ? trimSlice(src, pos, end2) : src.slice(pos, end2));
+      pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
+    }
+    const html = pLines === null ? inlineRangeJ(src, pStart, pLastEnd, resolveLink, linkCtx, allowNl, pMulti) : (() => { const t = pLines.join('\n'); return inlineRangeJ(t, 0, t.length, resolveLink, linkCtx, allowNl, pMulti); })();
+    if (excerpt === null) excerpt = html;
+    out += `<p>${html}</p>\\n`;
+  }
+  return { html: out, toc, excerpt: excerpt ?? '' };
+}
+
 // ---------------------------------------------------------------- Templates (Parse + Partial Eval + JIT Compile)
 
 const PATH_RE = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/;
@@ -839,6 +1124,24 @@ function escTextOf(v) {
   if (Array.isArray(v)) return escapeHtml(textOf(v));
   return '';
 }
+function textOfJ(v) {
+  if (typeof v === 'string') return jStr(v);
+  if (typeof v === 'number') return String(v);
+  if (typeof v === 'boolean') return v ? 'true' : 'false';
+  if (Array.isArray(v)) return jStr(textOf(v));
+  return '';
+}
+function escTextOfJ(v) {
+  if (typeof v === 'string') return escapeHtmlJ(v);
+  if (typeof v === 'number') return String(v);
+  if (typeof v === 'boolean') return v ? 'true' : 'false';
+  if (Array.isArray(v)) return escapeHtmlJ(textOf(v));
+  return '';
+}
+function isPreJRaw(path) {
+  const last = path[path.length - 1];
+  return last === 'content' || last === 'excerpt' || last === 'html';
+}
 
 function truthy(v) {
   if (Array.isArray(v)) return v.length > 0;
@@ -943,28 +1246,28 @@ function isStaticNodeList(nodes, bound, dynRoots) {
   return true;
 }
 
-function evalStaticNodes(nodes, env, out) {
+function evalStaticNodes(nodes, env, out, jm) {
   for (let i = 0; i < nodes.length; i++) {
     const n = nodes[i];
-    if (n.kind === 'text') out.push(n.text);
-    else if (n.kind === 'var') out.push(escTextOf(evalPath(n.path, env)));
-    else if (n.kind === 'raw') out.push(textOf(evalPath(n.path, env)));
-    else if (n.kind === 'if') {
+    if (n.kind === 'text') out.push(jm ? jStr(n.text) : n.text);
+    else if (n.kind === 'var') out.push((jm ? escTextOfJ : escTextOf)(evalPath(n.path, env)));
+    else if (n.kind === 'raw') {
+      const v = evalPath(n.path, env);
+      out.push(jm ? (isPreJRaw(n.path) && typeof v === 'string' ? v : textOfJ(v)) : textOf(v));
+    } else if (n.kind === 'if') {
       const cond = truthy(evalPath(n.path, env));
-      if (n.not ? !cond : cond) evalStaticNodes(n.then, env, out);
-      else if (n.else !== null) evalStaticNodes(n.else, env, out);
+      if (n.not ? !cond : cond) evalStaticNodes(n.then, env, out, jm);
+      else if (n.else !== null) evalStaticNodes(n.else, env, out, jm);
     } else if (n.kind === 'for') {
       const arr = evalPath(n.path, env);
       if (Array.isArray(arr)) {
         const len = arr.length;
-        const prevItem = env[n.name];
-        const hasItem = Object.hasOwn(env, n.name);
-        const prevLoop = env.loop;
-        const hasLoop = Object.hasOwn(env, 'loop');
+        const prevItem = env[n.name], hasItem = Object.hasOwn(env, n.name);
+        const prevLoop = env.loop, hasLoop = Object.hasOwn(env, 'loop');
         for (let k = 0; k < len; k++) {
           env[n.name] = arr[k];
           env.loop = { __proto__: null, index: k + 1, first: k === 0, last: k === len - 1, length: len };
-          evalStaticNodes(n.body, env, out);
+          evalStaticNodes(n.body, env, out, jm);
         }
         if (hasItem) env[n.name] = prevItem; else delete env[n.name];
         if (hasLoop) env.loop = prevLoop; else delete env.loop;
@@ -973,7 +1276,7 @@ function evalStaticNodes(nodes, env, out) {
   }
 }
 
-function foldAst(nodes, staticEnv, bound, dynRoots, truthyRoots, out) {
+function foldAst(nodes, staticEnv, bound, dynRoots, truthyRoots, out, jm) {
   const pushText = (txt) => {
     if (txt === '') return;
     if (out.length > 0 && out[out.length - 1].kind === 'text') {
@@ -985,12 +1288,12 @@ function foldAst(nodes, staticEnv, bound, dynRoots, truthyRoots, out) {
   for (let i = 0; i < nodes.length; i++) {
     const n = nodes[i];
     if (n.kind === 'text') {
-      pushText(n.text);
+      pushText(jm ? jStr(n.text) : n.text);
     } else if (n.kind === 'var' || n.kind === 'raw') {
       const r = n.path[0];
       if (!bound.has(r) && !dynRoots.has(r)) {
         const v = evalPath(n.path, staticEnv);
-        pushText(n.kind === 'var' ? escTextOf(v) : textOf(v));
+        pushText(n.kind === 'var' ? (jm ? escTextOfJ : escTextOf)(v) : (jm ? (isPreJRaw(n.path) && typeof v === 'string' ? v : textOfJ(v)) : textOf(v)));
       } else {
         out.push(n);
       }
@@ -999,17 +1302,17 @@ function foldAst(nodes, staticEnv, bound, dynRoots, truthyRoots, out) {
       if (!bound.has(r) && !dynRoots.has(r)) {
         const cond = truthy(evalPath(n.path, staticEnv));
         const branch = (n.not ? !cond : cond) ? n.then : n.else;
-        if (branch !== null) foldAst(branch, staticEnv, bound, dynRoots, truthyRoots, out);
+        if (branch !== null) foldAst(branch, staticEnv, bound, dynRoots, truthyRoots, out, jm);
       } else if (!bound.has(r) && n.path.length === 1 && truthyRoots.has(r)) {
         const branch = n.not ? n.else : n.then;
-        if (branch !== null) foldAst(branch, staticEnv, bound, dynRoots, truthyRoots, out);
+        if (branch !== null) foldAst(branch, staticEnv, bound, dynRoots, truthyRoots, out, jm);
       } else {
         const thenOut = [];
-        foldAst(n.then, staticEnv, bound, dynRoots, truthyRoots, thenOut);
+        foldAst(n.then, staticEnv, bound, dynRoots, truthyRoots, thenOut, jm);
         let elseOut = null;
         if (n.else !== null) {
           elseOut = [];
-          foldAst(n.else, staticEnv, bound, dynRoots, truthyRoots, elseOut);
+          foldAst(n.else, staticEnv, bound, dynRoots, truthyRoots, elseOut, jm);
         }
         out.push({ kind: 'if', not: n.not, path: n.path, then: thenOut, else: elseOut });
       }
@@ -1023,14 +1326,12 @@ function foldAst(nodes, staticEnv, bound, dynRoots, truthyRoots, out) {
         if (Array.isArray(arr)) {
           const buf = [];
           const len = arr.length;
-          const prevItem = staticEnv[n.name];
-          const hasItem = Object.hasOwn(staticEnv, n.name);
-          const prevLoop = staticEnv.loop;
-          const hasLoop = Object.hasOwn(staticEnv, 'loop');
+          const prevItem = staticEnv[n.name], hasItem = Object.hasOwn(staticEnv, n.name);
+          const prevLoop = staticEnv.loop, hasLoop = Object.hasOwn(staticEnv, 'loop');
           for (let k = 0; k < len; k++) {
             staticEnv[n.name] = arr[k];
             staticEnv.loop = { __proto__: null, index: k + 1, first: k === 0, last: k === len - 1, length: len };
-            evalStaticNodes(n.body, staticEnv, buf);
+            evalStaticNodes(n.body, staticEnv, buf, jm);
           }
           if (hasItem) staticEnv[n.name] = prevItem; else delete staticEnv[n.name];
           if (hasLoop) staticEnv.loop = prevLoop; else delete staticEnv.loop;
@@ -1038,7 +1339,7 @@ function foldAst(nodes, staticEnv, bound, dynRoots, truthyRoots, out) {
         }
       } else {
         const bodyOut = [];
-        foldAst(n.body, staticEnv, nextBound, dynRoots, truthyRoots, bodyOut);
+        foldAst(n.body, staticEnv, nextBound, dynRoots, truthyRoots, bodyOut, jm);
         out.push({ kind: 'for', name: n.name, path: n.path, body: bodyOut });
       }
     }
@@ -1069,7 +1370,7 @@ function bodyUsesBareLoop(list) {
   return false;
 }
 
-function compileTemplateBody(flat, extraVars, itemCaches, dynRoots, isItem) {
+function compileTemplateBody(flat, extraVars, itemCaches, dynRoots, isItem, jm, safeUrls) {
   if (flat.length === 0) return () => '';
   if (flat.length === 1 && flat[0].kind === 'text') {
     const s = flat[0].text;
@@ -1110,6 +1411,7 @@ function compileTemplateBody(flat, extraVars, itemCaches, dynRoots, isItem) {
       }
       if (frame.itemName === rootName) {
         base = frame.itemVar;
+        isKnownObj = true;
         break;
       }
     }
@@ -1156,6 +1458,8 @@ function compileTemplateBody(flat, extraVars, itemCaches, dynRoots, isItem) {
           if (r === 'loop' && (f === 'index' || f === 'length')) isSafe = true;
           else if (!isItem && dynRoots !== null && dynRoots.has(r)) {
             if (r === 'page' && (f === 'reading_minutes' || f === 'date' || f === 'date_long' || f === 'slug')) isSafe = true;
+            else if (r === 'h' && f === 'id') isSafe = true;
+            else if (safeUrls && (f === 'url' || f === 'newer_url' || f === 'older_url')) isSafe = true;
             else if (r === 'pager' && (f === 'number' || f === 'total')) isSafe = true;
             else if (r === 'tag' && (f === 'count' || f === 'slug')) isSafe = true;
           }
@@ -1178,13 +1482,23 @@ function compileTemplateBody(flat, extraVars, itemCaches, dynRoots, isItem) {
         else flatParts.push(e);
       } else if (n.kind === 'raw') {
         const p = n.path;
-        const isRawStr = !isItem && dynRoots !== null && dynRoots.has('page') && p.length === 2 && p[0] === 'page' && (p[1] === 'content' || p[1] === 'excerpt');
+        const isRawStr = jm ? isPreJRaw(p) : (!isItem && dynRoots !== null && dynRoots.has('page') && p.length === 2 && p[0] === 'page' && (p[1] === 'content' || p[1] === 'excerpt'));
         const e = isRawStr ? resolveExpr(p) : `_txt(${resolveExpr(p)})`;
         if (useAcc) batch.push(e);
         else flatParts.push(e);
       } else if (n.kind === 'if') {
         flush();
-        const cond = `_tru(${resolveExpr(n.path)})`;
+        const np = n.path;
+        let cond;
+        if (np.length === 2 && !isItem) {
+          const r = np[0], f = np[1];
+          if ((r === 'page' && (f === 'tags' || f === 'toc')) || (r === 'tag' && f === 'posts') || (r === 'p' && f === 'tags')) cond = `(${resolveExpr(np)}.length>0)`;
+          else if ((r === 'page' && (f === 'date' || f === 'summary')) || (r === 'pager' && (f === 'newer_url' || f === 'older_url')) || (r === 't' && f === 'url') || (r === 'p' && f === 'summary')) cond = `(${resolveExpr(np)}!=="")`;
+          else if (r === 'page' && (f === 'newer' || f === 'older')) cond = `(${resolveExpr(np)}!==null)`;
+          else cond = `_tru(${resolveExpr(np)})`;
+        } else {
+          cond = `_tru(${resolveExpr(np)})`;
+        }
         lines.push(`if (${n.not ? '!' + cond : cond}) {`);
         emit(n.then);
         if (n.else !== null && n.else.length > 0) {
@@ -1198,7 +1512,7 @@ function compileTemplateBody(flat, extraVars, itemCaches, dynRoots, isItem) {
         const lenVar = `_n${vid++}`;
         const idxVar = `_k${vid++}`;
         const itemVar = `_x${vid++}`;
-        const onlyItem = !isItem && scopeStack.length === 0 && !bodyUsesLoop(n.body) && (() => {
+        const onlyItem = (n.path.length !== 2 || n.path[1] !== 'toc') && !isItem && scopeStack.length === 0 && !bodyUsesLoop(n.body) && (() => {
           const b = new Set([n.name]);
           return isStaticNodeList(n.body, b, dynRoots);
         })();
@@ -1206,7 +1520,7 @@ function compileTemplateBody(flat, extraVars, itemCaches, dynRoots, isItem) {
           const key = n.name + ':' + JSON.stringify(n.body);
           let entry = itemCaches.get(key);
           if (entry === undefined) {
-            const subFn = compileTemplateBody(n.body, extraVars, null, null, n.name);
+            const subFn = compileTemplateBody(n.body, extraVars, null, null, n.name, jm, safeUrls);
             entry = { cache: new Map(), fn: subFn };
             itemCaches.set(key, entry);
           }
@@ -1256,16 +1570,17 @@ function compileTemplateBody(flat, extraVars, itemCaches, dynRoots, isItem) {
   } else {
     lines.push(`return [${flatParts.join(',')}].join("");`);
   }
+  const fnEsc = jm ? escTextOfJ : escTextOf, fnTxt = jm ? textOfJ : textOf;
   if (isItem) {
     const factory = new Function('_stat', '_esc', '_txt', '_tru', '_has', `return function(_item) {\n${lines.join('\n')}\n};`);
-    return factory(extraVars, escTextOf, textOf, truthy, Object.hasOwn);
+    return factory(extraVars, fnEsc, fnTxt, truthy, Object.hasOwn);
   }
   const factory = new Function('_esc', '_txt', '_tru', '_has', '_caches', `return function(vars) {\n${lines.join('\n')}\n};`);
-  return factory(escTextOf, textOf, truthy, Object.hasOwn, cacheRefs);
+  return factory(fnEsc, fnTxt, truthy, Object.hasOwn, cacheRefs);
 }
 
-function compileBodyToFn(flat, extraVars, itemCaches, dynRoots) {
-  return compileTemplateBody(flat, extraVars, itemCaches, dynRoots, null);
+function compileBodyToFn(flat, extraVars, itemCaches, dynRoots, jm, safeUrls) {
+  return compileTemplateBody(flat, extraVars, itemCaches, dynRoots, null, jm, safeUrls);
 }
 
 // ---------------------------------------------------------------- Path helpers
@@ -1304,7 +1619,7 @@ function resolveLinkCtx(ctx, target) {
   if (cached !== undefined) return cached;
   const c0 = target.charCodeAt(0);
   if (c0 === 47 || c0 === 35 || (target.includes(':') && SCHEME_RE.test(target))) {
-    const esc = escapeHtml(target);
+    const esc = ctx.jm ? escapeHtmlJ(target) : escapeHtml(target);
     ctx.urlMap.set(target, esc);
     return esc;
   }
@@ -1327,23 +1642,23 @@ function resolveLinkCtx(ctx, target) {
   if (path !== null) {
     const targetSrc = ctx.bySource.get(path);
     if (targetSrc !== undefined) {
-      const esc = escapeHtml(frag === '' ? targetSrc.url : `${targetSrc.url}${frag}`);
+      const esc = (ctx.jm ? escapeHtmlJ : escapeHtml)(frag === '' ? targetSrc.url : `${targetSrc.url}${frag}`);
       ctx.urlMap.set(target, esc);
       return esc;
     }
     if (ctx.staticPaths.has(path)) {
-      const esc = escapeHtml(frag === '' ? `${ctx.base}/${path}` : `${ctx.base}/${path}${frag}`);
+      const esc = (ctx.jm ? escapeHtmlJ : escapeHtml)(frag === '' ? `${ctx.base}/${path}` : `${ctx.base}/${path}${frag}`);
       ctx.urlMap.set(target, esc);
       return esc;
     }
   }
   ctx.broken.add(`broken-link ${ctx.srcPath} -> ${target}`);
-  return escapeHtml(target);
+  return (ctx.jm ? escapeHtmlJ : escapeHtml)(target);
 }
 
 // ---------------------------------------------------------------- Main entry
 
-export function run(input) {
+function runCore(input, jm) {
   const slugCache = new Map();
   const slugify = (text) => {
     let s = slugCache.get(text);
@@ -1368,6 +1683,7 @@ export function run(input) {
   }
 
   const base = input.site.base_url.replace(/\/+$/, '');
+  let safeUrls = !ESCJ_TEST.test(base);
   const files = [...input.files].sort((x, y) => byCodeUnits(x.path, y.path));
 
   const sources = [];
@@ -1429,6 +1745,7 @@ export function run(input) {
     const s = kept[i];
     const dir = s.post ? 'posts' : dirOf(s.path);
     let set = taken.get(dir);
+    if (safeUrls && dir !== '' && ESCJ_TEST.test(dir)) safeUrls = false;
     if (set === undefined) {
       set = new Set(dir === '' ? RESERVED : undefined);
       taken.set(dir, set);
@@ -1447,7 +1764,7 @@ export function run(input) {
   const dirPartsCache = new Map();
   const urlCaches = new Map();
   const emptyParts = [];
-  const linkCtx = { srcPath: '', dir: '', dirParts: emptyParts, bySource, staticPaths, base, broken, relCache: new Map(), urlMap: null };
+  const linkCtx = { srcPath: '', dir: '', dirParts: emptyParts, bySource, staticPaths, base, broken, relCache: new Map(), urlMap: null, jm };
   for (let i = 0; i < kept.length; i++) {
     const s = kept[i];
     const dir = dirOf(s.path);
@@ -1465,7 +1782,7 @@ export function run(input) {
     linkCtx.dir = dir;
     linkCtx.dirParts = dirParts;
     linkCtx.urlMap = urlMap;
-    const md = renderMarkdown(s.body, resolveLinkCtx, linkCtx, slugify);
+    const md = (jm ? renderMarkdownJ : renderMarkdown)(s.body, resolveLinkCtx, linkCtx, slugify);
     s.html = md.html;
     s.toc = md.toc;
     s.excerpt = md.excerpt;
@@ -1607,15 +1924,21 @@ export function run(input) {
       const folded = [];
       const dyn = DYN_BY_KIND[kind];
       const tru = TRUTHY_BY_KIND[kind];
-      foldAst(inlined, staticEnv, emptyBound, dyn, tru, folded);
-      const fn = compileBodyToFn(folded, staticEnv, itemCaches, dyn);
+      foldAst(inlined, staticEnv, emptyBound, dyn, tru, folded, jm);
+      const fn = compileBodyToFn(folded, staticEnv, itemCaches, dyn, jm, safeUrls);
       r = { fn, needsRm: astUsesProp(folded, 'reading_minutes') };
       compiled.set(key, r);
     }
     return r;
   };
 
-  const output = {};
+  const output = jm ? null : {};
+  const outKeys = jm ? new Set() : null;
+  const pairs = jm ? ['{'] : null;
+  let sep = '';
+  const emitFile = jm
+    ? (k, v) => { outKeys.add(k); pairs.push(sep + '"' + jStr(k) + '":"' + v + '"'); sep = ','; }
+    : (k, v) => { output[k] = v; };
   const pageObj = {
     __proto__: null,
     title: '',
@@ -1671,7 +1994,7 @@ export function run(input) {
       pageObj.older = null;
       pageObj.is_post = false;
     }
-    output[`${s.outDir}/index.html`] = renderer(pageVars);
+    emitFile(`${s.outDir}/index.html`, renderer(pageVars));
   }
 
   const indexRenderer = getRenderer('index', 'index')?.fn ?? null;
@@ -1691,7 +2014,7 @@ export function run(input) {
       pagerObj.newer_url = k === 1 ? '' : indexUrl(k - 1);
       pagerObj.older_url = k === pages ? '' : indexUrl(k + 1);
       indexVars.posts = pagePosts;
-      output[k === 1 ? 'index.html' : `page/${k}/index.html`] = indexRenderer(indexVars);
+      emitFile(k === 1 ? 'index.html' : `page/${k}/index.html`, indexRenderer(indexVars));
     }
   }
 
@@ -1708,26 +2031,28 @@ export function run(input) {
       tagObj.url = t.url;
       tagObj.count = t.posts.length;
       tagObj.posts = tPosts;
-      output[`tags/${t.slug}/index.html`] = tagRenderer(tagVars);
+      emitFile(`tags/${t.slug}/index.html`, tagRenderer(tagVars));
     }
   }
 
   const tagsRenderer = getRenderer('tags', 'tags')?.fn ?? null;
   if (tagsRenderer !== null) {
-    output['tags/index.html'] = tagsRenderer({ __proto__: null, site, tags: allTags, recent });
+    emitFile('tags/index.html', tagsRenderer({ __proto__: null, site, tags: allTags, recent }));
   }
 
   for (let i = 0; i < statics.length; i++) {
     const f = statics[i];
-    if (Object.hasOwn(output, f.path)) report.push(`shadowed ${f.path}: a built page has its path`);
-    else output[f.path] = f.content;
+    if (jm ? outKeys.has(f.path) : Object.hasOwn(output, f.path)) report.push(`shadowed ${f.path}: a built page has its path`);
+    else emitFile(f.path, jm ? jStr(f.content) : f.content);
   }
 
   // 8. Report
   const lines = [...report, ...broken].sort(byCodeUnits);
   const pagesCount = kept.length - posts.length;
   lines.push(`built ${pagesCount} pages, ${posts.length} posts, ${tagsList.length} tags and ${statics.length} static files`);
-  output[REPORT_FILE] = `${lines.join('\n')}\n`;
-
+  emitFile(REPORT_FILE, jm ? jStr(`${lines.join('\n')}\n`) : `${lines.join('\n')}\n`);
+  if (jm) { pairs.push('}'); return pairs.join(''); }
   return output;
 }
+export function run(input) { return runCore(input, false); }
+export function runJson(input) { return runCore(input, true); }
