@@ -52,7 +52,7 @@ function escapeHtmlJ(s) {
   return ESCJ_TEST.test(s) ? s.replace(ESCJ_RE, escJRepl) : s;
 }
 
-const SLUG_CODES = new Uint16Array(64);
+const SLUG_CODES = Buffer.allocUnsafe(64);
 
 function slugifyRaw(text) {
   const len = text.length;
@@ -81,7 +81,7 @@ function slugifyRaw(text) {
         }
         SLUG_CODES[n++] = ch;
       }
-      return n === 0 ? 'untitled' : String.fromCharCode.apply(null, n === 64 ? SLUG_CODES : SLUG_CODES.subarray(0, n));
+      return n === 0 ? 'untitled' : SLUG_CODES.toString('latin1', 0, n);
     }
     if (c >= 65 && c <= 90) c += 32;
     else if (!((c >= 97 && c <= 122) || (c >= 48 && c <= 57))) {
@@ -97,7 +97,7 @@ function slugifyRaw(text) {
     }
     SLUG_CODES[n++] = c;
   }
-  return n === 0 ? 'untitled' : String.fromCharCode.apply(null, n === 64 ? SLUG_CODES : SLUG_CODES.subarray(0, n));
+  return n === 0 ? 'untitled' : SLUG_CODES.toString('latin1', 0, n);
 }
 
 function uniqueSlug(slug, taken) {
@@ -117,30 +117,44 @@ function longDate(date) {
   return `${d} ${MONTHS[m - 1]} ${y}`;
 }
 
-const WS_U16 = new Uint8Array(65536);
-for (const cp of [
-  9, 10, 11, 12, 13, 32, 0xa0, 0x1680,
+const WS_LO = new Uint8Array(33);
+WS_LO[9] = WS_LO[10] = WS_LO[11] = WS_LO[12] = WS_LO[13] = WS_LO[32] = 1;
+const WS_HI = new Set([
+  0xa0, 0x1680,
   0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a,
   0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff,
-]) {
-  WS_U16[cp] = 1;
-}
+]);
 
 function wordsOf(text) {
   const len = text.length;
   let count = 0;
   let inWord = 0;
   for (let i = 0; i < len; i++) {
-    const ws = WS_U16[text.charCodeAt(i)];
-    if ((inWord | ws) === 0) count++;
-    inWord = ws ^ 1;
+    const c = text.charCodeAt(i);
+    if (c > 32) {
+      if (c < 160 || !WS_HI.has(c)) {
+        if (inWord === 0) { count++; inWord = 1; }
+      } else {
+        inWord = 0;
+      }
+    } else if (WS_LO[c] === 1) {
+      inWord = 0;
+    } else if (inWord === 0) {
+      count++;
+      inWord = 1;
+    }
   }
   return count;
 }
 
 function hasWhitespace(s) {
   for (let i = 0; i < s.length; i++) {
-    if (WS_U16[s.charCodeAt(i)] === 1) return true;
+    const c = s.charCodeAt(i);
+    if (c <= 32) {
+      if (WS_LO[c] === 1) return true;
+    } else if (c >= 160 && WS_HI.has(c)) {
+      return true;
+    }
   }
   return false;
 }
@@ -355,7 +369,8 @@ function findUnescaped(s, what, from, end) {
   while (pos <= limit) {
     const hit = s.indexOf(what, pos);
     if (hit === -1 || hit > limit) return -1;
-    let bs = hit - 1;
+    if (hit === from || s.charCodeAt(hit - 1) !== 92) return hit;
+    let bs = hit - 2;
     while (bs >= from && s.charCodeAt(bs) === 92) bs--;
     if (((hit - 1 - bs) & 1) === 0) return hit;
     pos = hit + 1;
@@ -368,11 +383,13 @@ function findSingleStar(s, from, end) {
   while (pos < end) {
     const hit = s.indexOf('*', pos);
     if (hit === -1 || hit >= end) return -1;
-    let bs = hit - 1;
-    while (bs >= from && s.charCodeAt(bs) === 92) bs--;
-    if (((hit - 1 - bs) & 1) === 1) {
-      pos = hit + 1;
-      continue;
+    if (hit > from && s.charCodeAt(hit - 1) === 92) {
+      let bs = hit - 2;
+      while (bs >= from && s.charCodeAt(bs) === 92) bs--;
+      if (((hit - 1 - bs) & 1) === 1) {
+        pos = hit + 1;
+        continue;
+      }
     }
     if (hit + 1 < end && s.charCodeAt(hit + 1) === 42) {
       pos = hit + 2;
@@ -947,6 +964,10 @@ function writeRawStr(s, slab) {
   const len = s.length;
   if (len === 0) return;
   if (slab.pos + len * 3 > slab.cap) growSlab(slab, len * 3);
+  if (len > 24) {
+    slab.pos += slab.buf.write(s, slab.pos, 'utf8');
+    return;
+  }
   const dst = slab.buf;
   let p = slab.pos;
   for (let i = 0; i < len; i++) {
@@ -1031,6 +1052,10 @@ function writeJStrSlab(s, start, end, slab) {
   const len = end - start;
   if (len <= 0) return;
   if (slab.pos + len * 6 > slab.cap) growSlab(slab, len * 6);
+  if (start === 0 && end === s.length && len > 24 && !JESC_TEST.test(s)) {
+    slab.pos += slab.buf.write(s, slab.pos, 'utf8');
+    return;
+  }
   const dst = slab.buf;
   let p = slab.pos;
   for (let i = start; i < end; i++) {
@@ -1064,6 +1089,10 @@ function writeHtmlJSlab(s, start, end, slab) {
   const len = end - start;
   if (len <= 0) return;
   if (slab.pos + len * 6 > slab.cap) growSlab(slab, len * 6);
+  if (start === 0 && end === s.length && len > 24 && !ESCJ_TEST.test(s)) {
+    slab.pos += slab.buf.write(s, slab.pos, 'utf8');
+    return;
+  }
   const dst = slab.buf;
   let p = slab.pos;
   for (let i = start; i < end; i++) {
@@ -1164,25 +1193,48 @@ function writeUtf8Char(s, i, end, slab) {
   return i + 1;
 }
 
-// Tiny zero-deopt leaf scanner for ASCII inline markdown + escaping;
-// stops on markdown syntax (* ` [ \), control chars < 32 (other than \n), or non-ASCII >= 128.
+// Tiny zero-deopt leaf scanner for inline markdown + escaping;
+// handles ASCII + 2-byte UTF-8 + HTML/JSON escapes inline, stopping only on * ` [ \ or control < 32 or >= 0x800.
 function scanInlineFast(s, i, end, slab) {
   const dst = slab.buf;
   let p = slab.pos;
   while (i < end) {
     const c = s.charCodeAt(i);
-    if (c >= 128) break;
-    if (INLINE_J_TBL[c] === 0) {
-      dst[p++] = c;
+    if (c < 128) {
+      if (INLINE_J_TBL[c] === 0) {
+        dst[p++] = c;
+        i++;
+        continue;
+      }
+      if (c === 10) { dst[p++] = 92; dst[p++] = 110; i++; continue; }
+      if (c === 39) { dst[p++]=38; dst[p++]=35; dst[p++]=51; dst[p++]=57; dst[p++]=59; i++; continue; }
+      if (c === 34) { dst[p++]=38; dst[p++]=113; dst[p++]=117; dst[p++]=111; dst[p++]=116; dst[p++]=59; i++; continue; }
+      if (c === 38) { dst[p++]=38; dst[p++]=97; dst[p++]=109; dst[p++]=112; dst[p++]=59; i++; continue; }
+      if (c === 60) { dst[p++]=38; dst[p++]=108; dst[p++]=116; dst[p++]=59; i++; continue; }
+      if (c === 62) { dst[p++]=38; dst[p++]=103; dst[p++]=116; dst[p++]=59; i++; continue; }
+      if (c === 92) {
+        if (i + 1 < end) {
+          const nc = s.charCodeAt(i + 1);
+          if (nc < 128 && ESCAPABLE[nc]) {
+            if (nc === 62) { dst[p++]=38; dst[p++]=103; dst[p++]=116; dst[p++]=59; }
+            else if (nc === 92) { dst[p++]=92; dst[p++]=92; }
+            else { dst[p++] = nc; }
+            i += 2;
+            continue;
+          }
+        }
+        dst[p++]=92; dst[p++]=92;
+        i++;
+        continue;
+      }
+      break;
+    }
+    if (c < 0x800) {
+      dst[p++] = 0xc0 | (c >> 6);
+      dst[p++] = 0x80 | (c & 0x3f);
       i++;
       continue;
     }
-    if (c === 10) { dst[p++] = 92; dst[p++] = 110; i++; continue; }
-    if (c === 39) { dst[p++]=38; dst[p++]=35; dst[p++]=51; dst[p++]=57; dst[p++]=59; i++; continue; }
-    if (c === 34) { dst[p++]=38; dst[p++]=113; dst[p++]=117; dst[p++]=111; dst[p++]=116; dst[p++]=59; i++; continue; }
-    if (c === 38) { dst[p++]=38; dst[p++]=97; dst[p++]=109; dst[p++]=112; dst[p++]=59; i++; continue; }
-    if (c === 60) { dst[p++]=38; dst[p++]=108; dst[p++]=116; dst[p++]=59; i++; continue; }
-    if (c === 62) { dst[p++]=38; dst[p++]=103; dst[p++]=116; dst[p++]=59; i++; continue; }
     break;
   }
   slab.pos = p;
@@ -1306,6 +1358,8 @@ function writeInlineJSlab(s, start, end, linkCtx, slab) {
     i++;
   }
 }
+
+let P_BOUNDS = new Int32Array(512);
 
 function renderMarkdownSlab(src, linkCtx, slugCache, ids, mdSlab) {
   const srcLen = src.length;
@@ -1505,7 +1559,7 @@ function renderMarkdownSlab(src, linkCtx, slugCache, ids, mdSlab) {
       p0Trimmed = true;
       while (pLastEnd > pStart && (src.charCodeAt(pLastEnd - 1) === 32 || src.charCodeAt(pLastEnd - 1) === 9)) pLastEnd--;
     }
-    let pLines = null;
+    let pLineCount = 0;
     pos = nextPos;
     while (pos <= srcLen) {
       const nl2 = src.indexOf('\n', pos);
@@ -1519,11 +1573,35 @@ function renderMarkdownSlab(src, linkCtx, slugCache, ids, mdSlab) {
         else if (isHrSlice(src, pos, end2, lc)) break;
       }
       const needTrim = lc === 32 || lc === 9 || src.charCodeAt(end2 - 1) === 32 || src.charCodeAt(end2 - 1) === 9;
-      if (pLines === null) {
-        if (p0Trimmed || needTrim) pLines = [src.slice(pStart, pLastEnd), needTrim ? trimSlice(src, pos, end2) : src.slice(pos, end2)];
-        else pLastEnd = end2;
+      if (pLineCount === 0) {
+        if (!p0Trimmed && !needTrim) {
+          pLastEnd = end2;
+        } else {
+          P_BOUNDS[0] = pStart;
+          P_BOUNDS[1] = pLastEnd;
+          let ls2 = pos, le2 = end2;
+          if (needTrim) {
+            while (ls2 < le2 && (src.charCodeAt(ls2) === 32 || src.charCodeAt(ls2) === 9)) ls2++;
+            while (le2 > ls2 && (src.charCodeAt(le2 - 1) === 32 || src.charCodeAt(le2 - 1) === 9)) le2--;
+          }
+          P_BOUNDS[2] = ls2;
+          P_BOUNDS[3] = le2;
+          pLineCount = 2;
+        }
       } else {
-        pLines.push(needTrim ? trimSlice(src, pos, end2) : src.slice(pos, end2));
+        if (pLineCount * 2 + 2 > P_BOUNDS.length) {
+          const grown = new Int32Array(P_BOUNDS.length * 2);
+          grown.set(P_BOUNDS);
+          P_BOUNDS = grown;
+        }
+        let ls2 = pos, le2 = end2;
+        if (needTrim) {
+          while (ls2 < le2 && (src.charCodeAt(ls2) === 32 || src.charCodeAt(ls2) === 9)) ls2++;
+          while (le2 > ls2 && (src.charCodeAt(le2 - 1) === 32 || src.charCodeAt(le2 - 1) === 9)) le2--;
+        }
+        P_BOUNDS[pLineCount * 2] = ls2;
+        P_BOUNDS[pLineCount * 2 + 1] = le2;
+        pLineCount++;
       }
       pos = nl2 === -1 ? srcLen + 1 : nl2 + 1;
     }
@@ -1532,10 +1610,13 @@ function renderMarkdownSlab(src, linkCtx, slugCache, ids, mdSlab) {
     d[dp++]=60; d[dp++]=112; d[dp++]=62;
     mdSlab.pos = dp;
     const pEx0 = dp;
-    if (pLines === null) {
+    if (pLineCount === 0) {
       writeInlineJSlab(src, pStart, pLastEnd, linkCtx, mdSlab);
     } else {
-      const t = pLines.join('\n');
+      let t = src.slice(P_BOUNDS[0], P_BOUNDS[1]);
+      for (let li = 1; li < pLineCount; li++) {
+        t += '\n' + src.slice(P_BOUNDS[li * 2], P_BOUNDS[li * 2 + 1]);
+      }
       writeInlineJSlab(t, 0, t.length, linkCtx, mdSlab);
     }
     const pEx1 = mdSlab.pos;
@@ -1723,7 +1804,7 @@ function compileTemplateBodySlab(flat, extraVars, itemCaches, dynRoots, isItem, 
           let entry = itemCaches.get(key);
           if (entry === undefined) {
             const subFn = compileTemplateBodySlab(n.body, extraVars, null, null, n.name, safeUrls, cardSlab);
-            entry = { cache: new Map(), fn: subFn, cardSlab };
+            entry = { cache: new Map(), fn: subFn, cardSlab, isPrimary: itemCaches.size === 0 };
             itemCaches.set(key, entry);
           }
           const cid = cacheRefs.length;
@@ -1732,12 +1813,21 @@ function compileTemplateBodySlab(flat, extraVars, itemCaches, dynRoots, isItem, 
           lines.push(`if(Array.isArray(${arrVar})){`);
           lines.push(`const ${lenVar}=${arrVar}.length;`);
           lines.push(`const _c${cid}=_caches[${cid}].cache,_f${cid}=_caches[${cid}].fn,_cs${cid}=_caches[${cid}].cardSlab;`);
-          lines.push(`for(let ${idxVar}=0;${idxVar}<${lenVar};${idxVar}++){`);
-          lines.push(`const ${itemVar}=${arrVar}[${idxVar}];`);
-          lines.push(`let _r${cid}=_c${cid}.get(${itemVar});`);
-          lines.push(`if(_r${cid}===undefined){const _s0=_cs${cid}.pos;_f${cid}(${itemVar},_cs${cid},_md);_r${cid}=_s0*16777216+_cs${cid}.pos;_c${cid}.set(${itemVar},_r${cid});}`);
-          lines.push(`const _e${cid}=_r${cid}%16777216;const _s${cid}=(_r${cid}-_e${cid})/16777216;_wS(_slab,_cs${cid}.buf,_s${cid},_e${cid});`);
-          lines.push('}}');
+          if (entry.isPrimary) {
+            lines.push(`for(let ${idxVar}=0;${idxVar}<${lenVar};${idxVar}++){`);
+            lines.push(`const ${itemVar}=${arrVar}[${idxVar}];`);
+            lines.push(`let _r${cid}=${itemVar}._cR;`);
+            lines.push(`if(_r${cid}===undefined){const _s0=_cs${cid}.pos;_f${cid}(${itemVar},_cs${cid},_md);_r${cid}=_s0*16777216+_cs${cid}.pos;${itemVar}._cR=_r${cid};}`);
+            lines.push(`const _e${cid}=_r${cid}%16777216;const _s${cid}=(_r${cid}-_e${cid})/16777216;_wS(_slab,_cs${cid}.buf,_s${cid},_e${cid});`);
+            lines.push('}}');
+          } else {
+            lines.push(`for(let ${idxVar}=0;${idxVar}<${lenVar};${idxVar}++){`);
+            lines.push(`const ${itemVar}=${arrVar}[${idxVar}];`);
+            lines.push(`let _r${cid}=_c${cid}.get(${itemVar});`);
+            lines.push(`if(_r${cid}===undefined){const _s0=_cs${cid}.pos;_f${cid}(${itemVar},_cs${cid},_md);_r${cid}=_s0*16777216+_cs${cid}.pos;_c${cid}.set(${itemVar},_r${cid});}`);
+            lines.push(`const _e${cid}=_r${cid}%16777216;const _s${cid}=(_r${cid}-_e${cid})/16777216;_wS(_slab,_cs${cid}.buf,_s${cid},_e${cid});`);
+            lines.push('}}');
+          }
         } else {
           const needBareLoop = bodyUsesBareLoop(n.body);
           const loopVar = needBareLoop ? `_l${vid++}` : 'undefined';
@@ -1957,6 +2047,7 @@ function runCoreSlab(input, outSlab, mdSlab, cardSlab) {
   }
 
   const bySlug = new Map();
+  const tagSeen = new Set();
   for (let i = 0; i < posts.length; i++) {
     const p = posts[i];
     const rawTags = p.data.tags;
@@ -1964,21 +2055,42 @@ function runCoreSlab(input, outSlab, mdSlab, cardSlab) {
       p.tagRefs = [];
       continue;
     }
+    const rlen = rawTags.length;
     const refs = [];
-    const seen = new Set();
-    for (let j = 0; j < rawTags.length; j++) {
-      const name = rawTags[j];
-      const slug = slugifyCached(slugCache, name);
-      if (seen.has(slug)) continue;
-      seen.add(slug);
-      let tag = bySlug.get(slug);
-      if (tag === undefined) {
-        const url = `${base}/tags/${slug}/`;
-        tag = { name, slug, url, posts: [], pub: { name, slug, url } };
-        bySlug.set(slug, tag);
+    if (rlen <= 4) {
+      for (let j = 0; j < rlen; j++) {
+        const name = rawTags[j];
+        const slug = slugifyCached(slugCache, name);
+        let dup = false;
+        for (let m = 0; m < refs.length; m++) {
+          if (refs[m].slug === slug) { dup = true; break; }
+        }
+        if (dup) continue;
+        let tag = bySlug.get(slug);
+        if (tag === undefined) {
+          const url = `${base}/tags/${slug}/`;
+          tag = { name, slug, url, posts: [], pub: { name, slug, url } };
+          bySlug.set(slug, tag);
+        }
+        tag.posts.push(p);
+        refs.push(tag.pub);
       }
-      tag.posts.push(p);
-      refs.push(tag.pub);
+    } else {
+      tagSeen.clear();
+      for (let j = 0; j < rlen; j++) {
+        const name = rawTags[j];
+        const slug = slugifyCached(slugCache, name);
+        if (tagSeen.has(slug)) continue;
+        tagSeen.add(slug);
+        let tag = bySlug.get(slug);
+        if (tag === undefined) {
+          const url = `${base}/tags/${slug}/`;
+          tag = { name, slug, url, posts: [], pub: { name, slug, url } };
+          bySlug.set(slug, tag);
+        }
+        tag.posts.push(p);
+        refs.push(tag.pub);
+      }
     }
     p.tagRefs = refs;
   }
@@ -1990,15 +2102,30 @@ function runCoreSlab(input, outSlab, mdSlab, cardSlab) {
         s.tagRefs = [];
         continue;
       }
+      const rlen = rawTags.length;
       const refs = [];
-      const seen = new Set();
-      for (let j = 0; j < rawTags.length; j++) {
-        const name = rawTags[j];
-        const slug = slugifyCached(slugCache, name);
-        if (seen.has(slug)) continue;
-        seen.add(slug);
-        const existing = bySlug.get(slug);
-        refs.push(existing !== undefined ? existing.pub : { name, slug, url: '' });
+      if (rlen <= 4) {
+        for (let j = 0; j < rlen; j++) {
+          const name = rawTags[j];
+          const slug = slugifyCached(slugCache, name);
+          let dup = false;
+          for (let m = 0; m < refs.length; m++) {
+            if (refs[m].slug === slug) { dup = true; break; }
+          }
+          if (dup) continue;
+          const existing = bySlug.get(slug);
+          refs.push(existing !== undefined ? existing.pub : { name, slug, url: '' });
+        }
+      } else {
+        tagSeen.clear();
+        for (let j = 0; j < rlen; j++) {
+          const name = rawTags[j];
+          const slug = slugifyCached(slugCache, name);
+          if (tagSeen.has(slug)) continue;
+          tagSeen.add(slug);
+          const existing = bySlug.get(slug);
+          refs.push(existing !== undefined ? existing.pub : { name, slug, url: '' });
+        }
       }
       s.tagRefs = refs;
     }

@@ -1,10 +1,8 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { setFlagsFromString } from 'node:v8';
 
-setFlagsFromString('--no-turbofan');
 setFlagsFromString('--no-concurrent-recompilation');
 setFlagsFromString('--no-incremental-marking');
-setFlagsFromString('--max-semi-space-size=64');
 
 const { solveCasesToBuffer } = await import('./solve.js');
 
