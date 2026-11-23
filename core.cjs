@@ -117,6 +117,9 @@ function longDate(date) {
   return `${d} ${MONTHS[m - 1]} ${y}`;
 }
 
+const WS256 = new Uint8Array(256);
+WS256[9] = WS256[10] = WS256[11] = WS256[12] = WS256[13] = WS256[32] = WS256[160] = 1;
+const HI_WS_TEST = /[\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]/;
 const WS_LO = new Uint8Array(33);
 WS_LO[9] = WS_LO[10] = WS_LO[11] = WS_LO[12] = WS_LO[13] = WS_LO[32] = 1;
 const WS_HI = new Set([
@@ -127,6 +130,17 @@ const WS_HI = new Set([
 
 function wordsOf(text) {
   const len = text.length;
+  if (!HI_WS_TEST.test(text)) {
+    let count = 0;
+    let prevWs = 1;
+    for (let i = 0; i < len; i++) {
+      const c = text.charCodeAt(i);
+      const isWs = c < 256 ? WS256[c] : 0;
+      count += prevWs & (isWs ^ 1);
+      prevWs = isWs;
+    }
+    return count;
+  }
   let count = 0;
   let i = 0;
   while (i < len) {
@@ -1238,6 +1252,18 @@ function writeUtf8Char(s, i, end, slab) {
 function scanInlineFast(s, i, end, slab) {
   const dst = slab.buf;
   let p = slab.pos;
+  while (i + 4 <= end) {
+    const c0 = s.charCodeAt(i);
+    const c1 = s.charCodeAt(i + 1);
+    const c2 = s.charCodeAt(i + 2);
+    const c3 = s.charCodeAt(i + 3);
+    if ((c0 | c1 | c2 | c3) < 128 && (INLINE_J_TBL[c0] | INLINE_J_TBL[c1] | INLINE_J_TBL[c2] | INLINE_J_TBL[c3]) === 0) {
+      dst[p] = c0; dst[p + 1] = c1; dst[p + 2] = c2; dst[p + 3] = c3;
+      p += 4; i += 4;
+      continue;
+    }
+    break;
+  }
   while (i < end) {
     const c = s.charCodeAt(i);
     if (c < 128) {
