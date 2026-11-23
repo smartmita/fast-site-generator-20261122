@@ -1,4 +1,4 @@
-import { closeSync, openSync, readFileSync, writeSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { setFlagsFromString } from 'node:v8';
 
 setFlagsFromString('--no-opt');
@@ -11,11 +11,10 @@ const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 const cases = JSON.parse(readFileSync(`${INPUT_DIR}/cases.json`, 'utf8')) as { id: string; input: unknown }[];
-const fd = openSync(`${OUTPUT_DIR}/answers.json`, 'w');
-writeSync(fd, '[');
+let out = '[';
 for (let i = 0; i < cases.length; i++) {
-  if (i > 0) writeSync(fd, ',');
-  writeSync(fd, runJson(cases[i].input));
+  if (i > 0) out += ',';
+  out += runJson(cases[i].input);
 }
-writeSync(fd, ']');
-closeSync(fd);
+out += ']';
+writeFileSync(`${OUTPUT_DIR}/answers.json`, out);
