@@ -1,9 +1,8 @@
 const { readFileSync, writeFileSync } = require('node:fs');
 const { setFlagsFromString } = require('node:v8');
 
-// Explicitly enable Maglev on Node 22 (off by default in V8 12.4) while avoiding slow TurboFan tier-up and background threads.
-setFlagsFromString('--maglev');
-setFlagsFromString('--no-turbofan');
+// Disable V8 optimizing compilers to eliminate JIT compile overhead on single-shot execution.
+setFlagsFromString('--no-opt');
 setFlagsFromString('--no-concurrent-recompilation');
 setFlagsFromString('--no-incremental-marking');
 setFlagsFromString('--no-concurrent-sweeping');
