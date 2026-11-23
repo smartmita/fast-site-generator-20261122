@@ -128,21 +128,33 @@ const WS_HI = new Set([
 function wordsOf(text) {
   const len = text.length;
   let count = 0;
-  let inWord = 0;
-  for (let i = 0; i < len; i++) {
-    const c = text.charCodeAt(i);
+  let i = 0;
+  while (i < len) {
+    let c = text.charCodeAt(i);
     if (c > 32) {
       if (c < 160 || !WS_HI.has(c)) {
-        if (inWord === 0) { count++; inWord = 1; }
-      } else {
-        inWord = 0;
+        count++;
+        i++;
+        while (i < len) {
+          c = text.charCodeAt(i);
+          if (c > 32 && c < 160) { i++; continue; }
+          if (c <= 32 ? WS_LO[c] === 1 : WS_HI.has(c)) break;
+          i++;
+        }
+        continue;
       }
-    } else if (WS_LO[c] === 1) {
-      inWord = 0;
-    } else if (inWord === 0) {
+    } else if (WS_LO[c] === 0) {
       count++;
-      inWord = 1;
+      i++;
+      while (i < len) {
+        c = text.charCodeAt(i);
+        if (c > 32 && c < 160) { i++; continue; }
+        if (c <= 32 ? WS_LO[c] === 1 : WS_HI.has(c)) break;
+        i++;
+      }
+      continue;
     }
+    i++;
   }
   return count;
 }
@@ -219,6 +231,7 @@ function parseFmValue(key, raw, data) {
         const d = d0 * 10 + d1;
         if (y >= 1970 && y <= 2099 && mo >= 1 && mo <= 12 && d >= 1 && d <= daysIn(y, mo)) {
           data.date = raw;
+          data._dateInt = y * 10000 + mo * 100 + d;
           return null;
         }
       }
@@ -227,6 +240,7 @@ function parseFmValue(key, raw, data) {
   }
   if (key === 'tags') {
     if (raw.charCodeAt(0) !== 91 || raw.charCodeAt(raw.length - 1) !== 93) return 'key "tags": not a list [a, b]';
+    if (raw.length === 2) { data.tags = []; return null; }
     const inner = raw.slice(1, -1);
     if (inner.trim() === '') { data.tags = []; return null; }
     const parts = inner.split(',');
@@ -287,33 +301,33 @@ function parseFrontMatter(text) {
       return null;
     }
     if (!startIsBlank(text, pos, end) && text.charCodeAt(pos) !== 35) {
-      let colon = -1;
-      let validKey = true;
-      for (let k = pos; k < end; k++) {
+      const colon = text.indexOf(':', pos);
+      if (colon <= pos || colon >= end) return `line ${lineIdx + 1} is not "key: value"`;
+      for (let k = pos; k < colon; k++) {
         const kc = text.charCodeAt(k);
-        if (kc === 58) {
-          colon = k;
-          break;
-        }
-        if (!((kc >= 97 && kc <= 122) || kc === 95)) {
-          validKey = false;
-        }
+        if (!((kc >= 97 && kc <= 122) || kc === 95)) return `line ${lineIdx + 1} is not "key: value"`;
       }
-      if (colon <= pos || !validKey) return `line ${lineIdx + 1} is not "key: value"`;
       if (colon + 1 < end && text.charCodeAt(colon + 1) !== 32) return `line ${lineIdx + 1} is not "key: value"`;
-      const key = text.slice(pos, colon);
       let rawEnd = end;
       while (rawEnd > colon + 2 && (text.charCodeAt(rawEnd - 1) === 32 || text.charCodeAt(rawEnd - 1) === 9)) rawEnd--;
       const raw = colon + 2 <= rawEnd ? text.slice(colon + 2, rawEnd) : '';
+      const klen = colon - pos;
+      let key;
       let bit = 0;
-      if (key === 'title') bit = 1;
-      else if (key === 'date') bit = 2;
-      else if (key === 'tags') bit = 4;
-      else if (key === 'draft') bit = 8;
-      else if (key === 'layout') bit = 16;
-      else if (key === 'slug') bit = 32;
-      else if (key === 'summary') bit = 64;
-      else return `unknown key "${key}"`;
+      if (klen === 5 && text.charCodeAt(pos) === 116 && text.slice(pos, colon) === 'title') { key = 'title'; bit = 1; }
+      else if (klen === 4) {
+        key = text.slice(pos, colon);
+        if (key === 'date') bit = 2;
+        else if (key === 'tags') bit = 4;
+        else if (key === 'slug') bit = 32;
+        else return `unknown key "${key}"`;
+      } else if (klen === 5 && text.charCodeAt(pos) === 100 && text.slice(pos, colon) === 'draft') { key = 'draft'; bit = 8; }
+      else if (klen === 6 && text.slice(pos, colon) === 'layout') { key = 'layout'; bit = 16; }
+      else if (klen === 7 && text.slice(pos, colon) === 'summary') { key = 'summary'; bit = 64; }
+      else {
+        key = text.slice(pos, colon);
+        return `unknown key "${key}"`;
+      }
       if ((mask & bit) !== 0) return `key "${key}" is given twice`;
       if (raw === '') return `key "${key}" has no value`;
       const err = parseFmValue(key, raw, data);
@@ -936,7 +950,7 @@ function writeSlabBuf(slab, src) {
   if (slab.pos + len > slab.cap) growSlab(slab, len);
   const dst = slab.buf;
   let p = slab.pos;
-  if (len <= 16) {
+  if (len <= 64) {
     for (let i = 0; i < len; i++) dst[p++] = src[i];
   } else {
     dst.set(src, p);
@@ -1164,6 +1178,22 @@ const B_BQ_CLOSE = Buffer.from('</p>\\n</blockquote>\\n');
 function resolveLinkATagBuf(ctx, target) {
   let buf = ctx.aBufMap.get(target);
   if (buf !== undefined) return buf;
+  const c0 = target.charCodeAt(0);
+  if (c0 === 47 || c0 === 35 || (target.includes(':') && SCHEME_RE.test(target))) {
+    let esc = ctx.extMap.get(target);
+    if (esc === undefined) {
+      esc = escapeHtmlJ(target);
+      ctx.extMap.set(target, esc);
+    }
+    buf = ctx.extABufMap.get(target);
+    if (buf === undefined) {
+      buf = Buffer.from(`<a href=\\"${esc}\\">`, 'utf8');
+      ctx.extABufMap.set(target, buf);
+    }
+    ctx.urlMap.set(target, esc);
+    ctx.aBufMap.set(target, buf);
+    return buf;
+  }
   const url = resolveLinkCtx(ctx, target);
   buf = Buffer.from(`<a href=\\"${url}\\">`, 'utf8');
   if (ctx.urlMap.has(target)) ctx.aBufMap.set(target, buf);
@@ -1315,8 +1345,16 @@ function writeInlineJSlab(s, start, end, linkCtx, slab) {
           aBuf = resolveLinkATagBuf(linkCtx, target);
         }
         if (aBuf !== undefined) {
-          slab.buf.set(aBuf, slab.pos);
-          slab.pos += aBuf.length;
+          const alen = aBuf.length;
+          const dst = slab.buf;
+          let p = slab.pos;
+          if (alen <= 64) {
+            for (let q = 0; q < alen; q++) dst[p++] = aBuf[q];
+            slab.pos = p;
+          } else {
+            dst.set(aBuf, p);
+            slab.pos = p + alen;
+          }
           writeInlineJSlab(s, i + 1, k, linkCtx, slab);
           const d1 = slab.buf; let p1 = slab.pos;
           d1[p1++]=60; d1[p1++]=47; d1[p1++]=97; d1[p1++]=62;
@@ -1426,7 +1464,8 @@ function renderMarkdownSlab(src, linkCtx, slugCache, ids, mdSlab) {
             buf[p++]=92; buf[p++]=34; buf[p++]=62;
             mdSlab.pos = p;
             const hStart = p;
-            writeInlineJSlab(src, hs, he, linkCtx, mdSlab);
+            const hk = scanInlineFast(src, hs, he, mdSlab);
+            if (hk < he) writeInlineJSlab(src, hk, he, linkCtx, mdSlab);
             const hEnd = mdSlab.pos;
             p = hEnd;
             buf[p++]=60; buf[p++]=47; buf[p++]=104; buf[p++]=48+d; buf[p++]=62; buf[p++]=92; buf[p++]=110;
@@ -1457,8 +1496,13 @@ function renderMarkdownSlab(src, linkCtx, slugCache, ids, mdSlab) {
             let dp = mdSlab.pos;
             d[dp++]=60; d[dp++]=108; d[dp++]=105; d[dp++]=62;
             mdSlab.pos = dp;
-            if (curItem === null) writeInlineJSlab(src, curStart, curEnd, linkCtx, mdSlab);
-            else writeInlineJSlab(curItem, 0, curItem.length, linkCtx, mdSlab);
+            if (curItem === null) {
+              const lk = scanInlineFast(src, curStart, curEnd, mdSlab);
+              if (lk < curEnd) writeInlineJSlab(src, lk, curEnd, linkCtx, mdSlab);
+            } else {
+              const lk = scanInlineFast(curItem, 0, curItem.length, mdSlab);
+              if (lk < curItem.length) writeInlineJSlab(curItem, lk, curItem.length, linkCtx, mdSlab);
+            }
             dp = mdSlab.pos;
             d[dp++]=60; d[dp++]=47; d[dp++]=108; d[dp++]=105; d[dp++]=62; d[dp++]=92; d[dp++]=110;
             mdSlab.pos = dp;
@@ -1523,8 +1567,13 @@ function renderMarkdownSlab(src, linkCtx, slugCache, ids, mdSlab) {
             let dp = mdSlab.pos;
             d[dp++]=60; d[dp++]=108; d[dp++]=105; d[dp++]=62;
             mdSlab.pos = dp;
-            if (curItem === null) writeInlineJSlab(src, curStart, curEnd, linkCtx, mdSlab);
-            else writeInlineJSlab(curItem, 0, curItem.length, linkCtx, mdSlab);
+            if (curItem === null) {
+              const lk = scanInlineFast(src, curStart, curEnd, mdSlab);
+              if (lk < curEnd) writeInlineJSlab(src, lk, curEnd, linkCtx, mdSlab);
+            } else {
+              const lk = scanInlineFast(curItem, 0, curItem.length, mdSlab);
+              if (lk < curItem.length) writeInlineJSlab(curItem, lk, curItem.length, linkCtx, mdSlab);
+            }
             dp = mdSlab.pos;
             d[dp++]=60; d[dp++]=47; d[dp++]=108; d[dp++]=105; d[dp++]=62; d[dp++]=92; d[dp++]=110;
             mdSlab.pos = dp;
@@ -1611,13 +1660,15 @@ function renderMarkdownSlab(src, linkCtx, slugCache, ids, mdSlab) {
     mdSlab.pos = dp;
     const pEx0 = dp;
     if (pLineCount === 0) {
-      writeInlineJSlab(src, pStart, pLastEnd, linkCtx, mdSlab);
+      const k = scanInlineFast(src, pStart, pLastEnd, mdSlab);
+      if (k < pLastEnd) writeInlineJSlab(src, k, pLastEnd, linkCtx, mdSlab);
     } else {
       let t = src.slice(P_BOUNDS[0], P_BOUNDS[1]);
       for (let li = 1; li < pLineCount; li++) {
         t += '\n' + src.slice(P_BOUNDS[li * 2], P_BOUNDS[li * 2 + 1]);
       }
-      writeInlineJSlab(t, 0, t.length, linkCtx, mdSlab);
+      const k = scanInlineFast(t, 0, t.length, mdSlab);
+      if (k < t.length) writeInlineJSlab(t, k, t.length, linkCtx, mdSlab);
     }
     const pEx1 = mdSlab.pos;
     if (!hasExcerpt) {
@@ -1871,7 +1922,11 @@ const B_QUOTE_CLOSE = Buffer.from('"}');
 const B_KEY_SEP_FIRST = Buffer.from('"');
 const B_KEY_SEP_NEXT = Buffer.from('","');
 const B_KEY_COLON_QUOTE = Buffer.from('":"');
-const B_TAGS_INDEX_HTML = Buffer.from('tags/index.html');
+const B_SLASH_INDEX_HTML_COLON = Buffer.from('/index.html":"');
+const B_TAGS_PREFIX = Buffer.from('tags/');
+const B_PAGE_PREFIX = Buffer.from('page/');
+const B_INDEX_HTML_COLON = Buffer.from('index.html":"');
+const B_TAGS_INDEX_HTML_COLON = Buffer.from('tags/index.html":"');
 const B_REPORT_FILE = Buffer.from(REPORT_FILE);
 
 function slugifyCached(slugCache, text) {
@@ -1997,13 +2052,18 @@ function runCoreSlab(input, outSlab, mdSlab, cardSlab) {
   }
 
   const staticPaths = new Set();
-  for (let i = 0; i < statics.length; i++) staticPaths.add(statics[i].path);
+  let hasStaticHtml = false;
+  for (let i = 0; i < statics.length; i++) {
+    const p = statics[i].path;
+    staticPaths.add(p);
+    if (p.endsWith('index.html')) hasStaticHtml = true;
+  }
   const broken = new Set();
   const dirPartsCache = new Map();
   const urlCaches = new Map();
   const aBufCaches = new Map();
   const emptyParts = [];
-  const linkCtx = { srcPath: '', dir: '', dirParts: emptyParts, bySource, staticPaths, base, broken, relCache: new Map(), urlMap: null, aBufMap: null, extMap: new Map(), safeUrls };
+  const linkCtx = { srcPath: '', dir: '', dirParts: emptyParts, bySource, staticPaths, base, broken, relCache: new Map(), urlMap: null, aBufMap: null, extMap: new Map(), extABufMap: new Map(), safeUrls };
   const mdIds = new Set();
   for (let i = 0; i < kept.length; i++) {
     const s = kept[i];
@@ -2040,7 +2100,7 @@ function runCoreSlab(input, outSlab, mdSlab, cardSlab) {
   for (let i = 0; i < kept.length; i++) {
     if (kept[i].post) posts.push(kept[i]);
   }
-  posts.sort((x, y) => byCodeUnits(y.data.date, x.data.date) || byCodeUnits(x.slug, y.slug));
+  posts.sort((x, y) => (y.data._dateInt - x.data._dateInt) || byCodeUnits(x.slug, y.slug));
   for (let k = 0; k < posts.length; k++) {
     posts[k].newer = k === 0 ? null : posts[k - 1];
     posts[k].older = k === posts.length - 1 ? null : posts[k + 1];
@@ -2198,7 +2258,7 @@ function runCoreSlab(input, outSlab, mdSlab, cardSlab) {
 
   writeSlabBuf(outSlab, B_OPEN_BRACE);
   let hasEntry = false;
-  const outKeys = new Set();
+  const shadowedStatic = hasStaticHtml ? new Set() : null;
 
   const pageObj = {
     title: '',
@@ -2260,12 +2320,14 @@ function runCoreSlab(input, outSlab, mdSlab, cardSlab) {
       pageObj.older = null;
       pageObj.is_post = false;
     }
-    const key = `${s.outDir}/index.html`;
-    outKeys.add(key);
+    if (hasStaticHtml) {
+      const key = `${s.outDir}/index.html`;
+      if (staticPaths.has(key)) shadowedStatic.add(key);
+    }
     writeSlabBuf(outSlab, hasEntry ? B_KEY_SEP_NEXT : B_KEY_SEP_FIRST);
     hasEntry = true;
-    writeJStrSlab(key, 0, key.length, outSlab);
-    writeSlabBuf(outSlab, B_KEY_COLON_QUOTE);
+    writeJStrSlab(s.outDir, 0, s.outDir.length, outSlab);
+    writeSlabBuf(outSlab, B_SLASH_INDEX_HTML_COLON);
     renderer(pageVars, outSlab, mdSlab.buf);
   }
 
@@ -2286,12 +2348,20 @@ function runCoreSlab(input, outSlab, mdSlab, cardSlab) {
       pagerObj.newer_url = k === 1 ? '' : indexUrl(k - 1);
       pagerObj.older_url = k === pages ? '' : indexUrl(k + 1);
       indexVars.posts = pagePosts;
-      const key = k === 1 ? 'index.html' : `page/${k}/index.html`;
-      outKeys.add(key);
       writeSlabBuf(outSlab, hasEntry ? B_KEY_SEP_NEXT : B_KEY_SEP_FIRST);
       hasEntry = true;
-      writeJStrSlab(key, 0, key.length, outSlab);
-      writeSlabBuf(outSlab, B_KEY_COLON_QUOTE);
+      if (k === 1) {
+        if (hasStaticHtml && staticPaths.has('index.html')) shadowedStatic.add('index.html');
+        writeSlabBuf(outSlab, B_INDEX_HTML_COLON);
+      } else {
+        if (hasStaticHtml) {
+          const key = `page/${k}/index.html`;
+          if (staticPaths.has(key)) shadowedStatic.add(key);
+        }
+        writeSlabBuf(outSlab, B_PAGE_PREFIX);
+        writeAsciiOrVal(k, outSlab);
+        writeSlabBuf(outSlab, B_SLASH_INDEX_HTML_COLON);
+      }
       indexRenderer(indexVars, outSlab, mdSlab.buf);
     }
   }
@@ -2309,31 +2379,32 @@ function runCoreSlab(input, outSlab, mdSlab, cardSlab) {
       tagObj.url = t.url;
       tagObj.count = t.posts.length;
       tagObj.posts = tPosts;
-      const key = `tags/${t.slug}/index.html`;
-      outKeys.add(key);
+      if (hasStaticHtml) {
+        const key = `tags/${t.slug}/index.html`;
+        if (staticPaths.has(key)) shadowedStatic.add(key);
+      }
       writeSlabBuf(outSlab, hasEntry ? B_KEY_SEP_NEXT : B_KEY_SEP_FIRST);
       hasEntry = true;
-      writeJStrSlab(key, 0, key.length, outSlab);
-      writeSlabBuf(outSlab, B_KEY_COLON_QUOTE);
+      writeSlabBuf(outSlab, B_TAGS_PREFIX);
+      writeJStrSlab(t.slug, 0, t.slug.length, outSlab);
+      writeSlabBuf(outSlab, B_SLASH_INDEX_HTML_COLON);
       tagRenderer(tagVars, outSlab, mdSlab.buf);
     }
   }
 
   const tagsRenderer = getRenderer('tags', 'tags')?.fn ?? null;
   if (tagsRenderer !== null) {
-    outKeys.add('tags/index.html');
+    if (hasStaticHtml && staticPaths.has('tags/index.html')) shadowedStatic.add('tags/index.html');
     writeSlabBuf(outSlab, hasEntry ? B_KEY_SEP_NEXT : B_KEY_SEP_FIRST);
     hasEntry = true;
-    writeSlabBuf(outSlab, B_TAGS_INDEX_HTML);
-    writeSlabBuf(outSlab, B_KEY_COLON_QUOTE);
+    writeSlabBuf(outSlab, B_TAGS_INDEX_HTML_COLON);
     tagsRenderer({ site, tags: allTags, recent }, outSlab, mdSlab.buf);
   }
 
   for (let i = 0; i < statics.length; i++) {
     const f = statics[i];
-    if (outKeys.has(f.path)) report.push(`shadowed ${f.path}: a built page has its path`);
+    if (shadowedStatic !== null && shadowedStatic.has(f.path)) report.push(`shadowed ${f.path}: a built page has its path`);
     else {
-      outKeys.add(f.path);
       writeSlabBuf(outSlab, hasEntry ? B_KEY_SEP_NEXT : B_KEY_SEP_FIRST);
       hasEntry = true;
       writeJStrSlab(f.path, 0, f.path.length, outSlab);
@@ -2345,7 +2416,6 @@ function runCoreSlab(input, outSlab, mdSlab, cardSlab) {
   const lines = [...report, ...broken].sort(byCodeUnits);
   const pagesCount = kept.length - posts.length;
   lines.push(`built ${pagesCount} pages, ${posts.length} posts, ${tagsList.length} tags and ${statics.length} static files`);
-  outKeys.add(REPORT_FILE);
   writeSlabBuf(outSlab, hasEntry ? B_KEY_SEP_NEXT : B_KEY_SEP_FIRST);
   hasEntry = true;
   writeSlabBuf(outSlab, B_REPORT_FILE);
@@ -2362,8 +2432,8 @@ const B_ARR_CLOSE = Buffer.from(']');
 
 export function solveCasesToBuffer(cases) {
   const outSlab = makeSlab(10 * 1024 * 1024);
-  const mdSlab = makeSlab(2 * 1024 * 1024);
-  const cardSlab = makeSlab(256 * 1024);
+  const mdSlab = makeSlab(3 * 1024 * 1024);
+  const cardSlab = makeSlab(1024 * 1024);
   writeSlabBuf(outSlab, B_ARR_OPEN);
   for (let i = 0; i < cases.length; i++) {
     if (i > 0) writeSlabBuf(outSlab, B_ARR_COMMA);

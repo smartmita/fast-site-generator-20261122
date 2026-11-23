@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { setFlagsFromString } from 'node:v8';
 
+setFlagsFromString('--no-opt');
 setFlagsFromString('--no-concurrent-recompilation');
 setFlagsFromString('--no-incremental-marking');
 
